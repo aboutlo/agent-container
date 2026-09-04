@@ -17,7 +17,10 @@ Use only the project-local `crew_launch` tool for normal delegation.
 - The current Pi session is the **brain**.
 - The brain remains the final decision-maker.
 - Each delegated role runs as a separate agent in its own visible Herdr pane.
+- Each role owns an independent native Pi session; the brain session is the canonical shared orchestration history. Role sessions are private and are not automatically shared.
+- `crew_launch` defaults to a rolling `since-last-crew` handoff: the latest successful complete crew result plus newer brain messages, verbatim and bounded, never model-summarized. Use `contextMode: "explicit"` to opt out.
 - Keep role panes visible after completion unless the user asks to clean them up.
+- Automatic handoffs omit ordinary tool/provider payloads, including terminal/TUI output and runtime diagnostics, to preserve useful conversational context; retrieve a specific older fact with `crew_read_context` when necessary.
 - Reuse an idle same-cwd role pane in the same workspace/tab by default, so roles stay close to the brain pane.
 - Prefer short, focused role tasks over long autonomous chains.
 
@@ -67,11 +70,14 @@ For ordinary delegation, call `crew_launch` with:
 - `role`: role name, such as `scout`, `oracle`, `executor`, `reviewer`, or a configured custom role
 - `task`: a fully expanded, self-contained objective; the role cannot see the parent conversation
 - optional `context`, `constraints`, `acceptanceCriteria`, and `expectedOutput`
-- optional `startupTimeoutMs`, `timeoutMs`, and `readLines` only when defaults are insufficient
+- optional `command`: one native Pi slash command to execute in the target role session, such as `/openspec-propose`; this is not a shell command
+- optional `startupTimeoutMs`, `timeoutMs`, `readLines`, and `command` only when needed
 
 Never send unresolved references such as "above", "that", "the plan", or "implement it". Expand paths, decisions, constraints, and desired output in the contract.
 
 `crew_launch` handles pane creation/reuse, model launch, scoped agent names, prompting, waiting, queuing, and reading output.
+- Calls execute sequentially so later calls can consume results committed by earlier turns. Parallel independent research belongs in separate turns or explicit context.
+- When a concrete older fact blocks progress, use `crew_read_context` with `search`, `entry`, or `around`. It is bounded and read-only, limited to the invoking brain session before the checkpoint; it does not expose arbitrary paths, whole sessions, future entries, or another role's private session.
 
 Because Herdr agent names are globally unique, `crew_launch` may use a scoped name such as `scout-w5-t6` when plain `scout` is already used elsewhere. The prompt still says "You are scout...", so role behavior is unchanged.
 
@@ -81,7 +87,7 @@ For successful calls, `crew_launch` returns the role's marked final answer and h
 
 The user can be terse, such as "ask scout to map the auth flow". The brain expands that into a compact role contract using the role config.
 
-Before delegating any role, include enough context for that role to succeed. Include relevant prior messages, decisions, files, constraints, role outputs, acceptance criteria, and expected output shape. Do not send unresolved references like "above", "that", "the plan", "the review", or "implement it".
+Before delegating any role, provide a self-contained task and explicit constraints. Automatic handoff mode supplies a verbatim bounded rolling view of the brain history, so the brain need not manually copy prior role output. Do not send unresolved references like "above", "that", "the plan", "the review", or "implement it".
 
 Include only what matters:
 

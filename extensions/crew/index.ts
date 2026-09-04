@@ -1,10 +1,14 @@
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 type ExecResult = { code: number | null; stdout: string; stderr: string; killed?: boolean };
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
 type ToolUpdate = (partialResult: ToolResult) => void;
+type SessionMessage = { role?: string; toolName?: string; toolCallId?: string; isError?: boolean; content?: unknown; details?: Record<string, unknown> };
+type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; timestamp?: string; message?: SessionMessage };
+type ExtensionContext = { cwd: string; sessionManager: { getBranch(): SessionEntryLike[]; getLeafId(): string | null; getSessionFile(): string | undefined; getSessionId(): string; getSessionDir(): string } };
+
 type ExtensionAPI = {
   exec(command: string, args?: string[], options?: { timeout?: number; signal?: AbortSignal }): Promise<ExecResult>;
   registerTool(tool: {
@@ -14,7 +18,8 @@ type ExtensionAPI = {
     promptSnippet?: string;
     promptGuidelines?: string[];
     parameters?: unknown;
-    execute(toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate): Promise<unknown>;
+    executionMode?: "parallel" | "sequential";
+    execute(toolCallId: string, params: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate, ctx?: ExtensionContext): Promise<unknown>;
   }): void;
 };
 
@@ -36,6 +41,8 @@ type AgentLike = {
   status?: string;
   model?: string;
   model_id?: string;
+  agent_session_path?: string;
+  agent_session_id?: string;
 };
 
 const VERSION = "0.1.0";
@@ -156,18 +163,79 @@ export function resolveRole(roleName: string, config: CrewConfig): Role & { name
 
 export type DelegationFields = { context?: string; constraints?: string; acceptanceCriteria?: string; expectedOutput?: string };
 
-export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields = {}): string {
+export type ContextMode = "explicit" | "since-last-crew";
+export type CheckpointFallback = "recent" | "explicit" | "error";
+export type CrewContextSource = { version: 1; brainSessionId: string; checkpointEntryId?: string; upperBoundEntryId: string };
+export type CrewLaunchContext = { text: string; entries: SessionEntryLike[]; source?: CrewContextSource; checkpointEntryId?: string; fallbackUsed: boolean };
+
+function messageText(message: SessionMessage | undefined): string {
+  if (!message) return "";
+  const content = message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content === undefined ? "" : `[attachment: ${typeof content}]`;
+  return content.flatMap((item) => {
+    if (typeof item === "string") return [item];
+    if (!item || typeof item !== "object") return [];
+    const part = item as { type?: string; text?: unknown; name?: unknown; id?: unknown };
+    if (part.type === "thinking" || part.type === "thinkingSignature") return [];
+    if (part.type === "text" && typeof part.text === "string") return [part.text];
+    if (part.type === "toolCall") return [];
+    return [`[attachment: ${part.type ?? "unsupported content"}]`];
+  }).join("\n");
+}
+function eligibleEntry(entry: SessionEntryLike): boolean { return entry.type === "message" && !!entry.message && ["user", "assistant", "toolResult", "custom"].includes(entry.message.role ?? ""); }
+
+export function selectHandoffEntries(entries: SessionEntryLike[]): SessionEntryLike[] {
+  return entries.filter((entry) => {
+    if (!eligibleEntry(entry)) return false;
+    const message = entry.message!;
+    // Crew results are semantic checkpoints and must remain verbatim. Ordinary provider/tool
+    // payloads include terminal/TUI output and runtime diagnostics, so omit them from the
+    // normal handoff. Older detail remains available through bounded native-session reads.
+    return message.role !== "toolResult" || message.toolName === "crew_launch";
+  });
+}
+export function serializeSessionEntries(entries: SessionEntryLike[]): string {
+  return entries.filter(eligibleEntry).flatMap((entry) => {
+    const message = entry.message!;
+    const text = messageText(message).trim();
+    if (!text) return [];
+    const label = message.role === "toolResult" ? "crew result" : message.role ?? "message";
+    return [`[${label}]\n${text}`];
+  }).join("\n\n");
+}
+export function findCurrentCrewLaunch(branch: SessionEntryLike[], toolCallId: string): SessionEntryLike | undefined { return branch.find((entry) => entry.message?.role === "assistant" && Array.isArray(entry.message.content) && (entry.message.content as unknown[]).some((item) => item && typeof item === "object" && (item as { id?: string; name?: string }).id === toolCallId && (item as { name?: string }).name === "crew_launch")); }
+export function findCheckpoint(branch: SessionEntryLike[], beforeIndex: number): SessionEntryLike | undefined { for (let i = beforeIndex - 1; i >= 0; i -= 1) { const m = branch[i].message; if (m?.role === "toolResult" && m.toolName === "crew_launch" && m.isError === false && m.details?.complete === true) return branch[i]; } return undefined; }
+function userBoundaryIndex(branch: SessionEntryLike[], end: number, turns: number): number { let seen = 0; for (let i = end - 1; i >= 0; i -= 1) if (branch[i].message?.role === "user" && ++seen >= turns) return i; return 0; }
+export function buildHandoff(branch: SessionEntryLike[], toolCallId: string, mode: ContextMode = "since-last-crew", fallback: CheckpointFallback = "recent", recentTurns = 6, maxChars = 24_000, explicitText = ""): CrewLaunchContext {
+  if (mode === "explicit") return { text: explicitText, entries: [], fallbackUsed: false };
+  const current = findCurrentCrewLaunch(branch, toolCallId); if (!current) throw new Error(`Cannot build crew handoff: current crew_launch tool call ${toolCallId} was not found in the active branch.`);
+  const end = branch.indexOf(current); const checkpoint = findCheckpoint(branch, end);
+  if (!checkpoint && fallback === "error") throw new Error("Cannot build crew handoff: no successful complete crew_launch checkpoint exists in the active branch.");
+  const start = checkpoint ? branch.indexOf(checkpoint) : userBoundaryIndex(branch, end, recentTurns); const entries = selectHandoffEntries(branch.slice(start, end)); const text = serializeSessionEntries(entries);
+  if (text.length > maxChars) throw new Error(`Crew handoff exceeds maxHandoffChars: ${entries.length} entries, ${text.length} characters (limit ${maxChars}).`);
+  return { text, entries, checkpointEntryId: checkpoint?.id, fallbackUsed: !checkpoint };
+}
+export function sourceLocatorBlock(source: CrewContextSource): string { return `<crew-context-source>\n${JSON.stringify(source)}\n</crew-context-source>`; }
+function parseSource(text: string): CrewContextSource | undefined { const match = text.match(/<crew-context-source>\s*([\s\S]*?)\s*<\/crew-context-source>/); if (!match) return undefined; try { const value = JSON.parse(match[1]) as CrewContextSource; return value.version === 1 && typeof value.brainSessionId === "string" && typeof value.upperBoundEntryId === "string" ? value : undefined; } catch { return undefined; } }
+export function parseJsonlSession(raw: string): { sessionId: string; entries: SessionEntryLike[] } { const lines = raw.split(/\r?\n/).filter(Boolean); if (!lines.length) throw new Error("Native session is empty"); const parsed: unknown[] = []; for (let i = 0; i < lines.length; i += 1) { try { parsed.push(JSON.parse(lines[i])); } catch { if (i !== lines.length - 1) throw new Error(`Malformed native session JSONL at line ${i + 1}`); } } const header = parsed[0] as { type?: string; id?: string; sessionId?: string; session_id?: string } | undefined; const sessionId = header?.sessionId ?? header?.session_id ?? header?.id; if (header?.type !== "session" || typeof sessionId !== "string") throw new Error("Native session has an invalid header"); return { sessionId, entries: parsed.slice(1) as SessionEntryLike[] }; }
+export function reconstructBranch(entries: SessionEntryLike[], upperBoundId: string): SessionEntryLike[] { const byId = new Map(entries.filter(e => typeof e.id === "string").map(e => [e.id!, e])); const chain: SessionEntryLike[] = []; let cursor: SessionEntryLike | undefined = byId.get(upperBoundId); if (!cursor) throw new Error(`upperBoundEntryId ${upperBoundId} was not found in the native session`); while (cursor) { chain.push(cursor); cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined; } return chain.reverse(); }
+
+export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields & { contextMode?: ContextMode; sourceLocator?: string } = {}): string {
+  const automatic = fields.contextMode === "since-last-crew";
   return [
     `You are ${roleName}.${role.description ? ` ${role.description}` : ""} Authority: ${role.authority ?? "unspecified"}. Task: ${task}`,
     `## Role\n${roleName}${role.description ? `\n${role.description}` : ""}`,
     `## Authority\n${role.authority === "read-only" ? "read-only\nDo not create, modify, rename, or delete files, and do not run mutating commands." : role.authority === "can-edit" ? "can-edit\nModify only the requested scope; do not make unrelated changes." : "unspecified"}`, 
     `## Working directory\n${cwd}`,
     `## Objective\n${task}`,
-    `## Context\n${fields.context || "No additional context supplied."}`,
+    `## Context\n${fields.context ? (automatic ? `## Brain handoff (verbatim)\n~~~text\n${fields.context}\n~~~\n## End brain handoff` : fields.context) : "No additional context supplied."}`, 
     `## Constraints\n${fields.constraints || "Follow repository conventions and do not exceed the requested scope."}`,
     `## Acceptance criteria\n${fields.acceptanceCriteria || "Explain what you checked and identify any remaining uncertainty."}`,
     `## Required response\n${fields.expectedOutput || "Return a concise summary of findings or changes, validation performed, and remaining risks."}`,
-    "You do not have access to the parent agent's conversation. Treat only this contract and repository contents as context.",
+    ...(automatic ? ["The Brain handoff below is a verbatim bounded view of the invoking brain session. Treat it as the authoritative prior context for this task. You do not have the full parent conversation automatically. If a concrete missing fact blocks progress and a native context source is supplied, use crew_read_context to search for that specific fact. Do not retrieve older context speculatively or read the underlying session file directly."] : ["You do not have access to the parent agent's conversation. Treat only this contract and repository contents as context."]),
+    ...(fields.sourceLocator ? [fields.sourceLocator] : []),
+    "Return a self-contained handoff artifact preserving decisions, evidence, file references, constraints, unresolved questions, and risks needed by the next role. Do not refer vaguely to unavailable context.",
   ].join("\n\n");
 }
 
@@ -435,6 +503,14 @@ export function normalizeTask(value: unknown, fields: DelegationFields = {}): st
   return task;
 }
 
+export function normalizeCommand(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim() === "") throw new Error("crew_launch command must be a non-blank Pi slash command");
+  const command = value.trim();
+  if (!command.startsWith("/") || command.includes("\n") || command.includes("\r") || command.length > 512) throw new Error("crew_launch command must be a single Pi slash command beginning with / and no longer than 512 characters");
+  return command;
+}
+
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(new Error("crew_launch was cancelled"));
   return new Promise((resolve, reject) => {
@@ -444,7 +520,7 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 type CrewLaunchParams = DelegationFields & {
-  role?: string; task?: string; startupTimeoutMs?: number; timeoutMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
+  role?: string; task?: string; command?: string; contextMode?: ContextMode; checkpointFallback?: CheckpointFallback; recentTurns?: number; maxHandoffChars?: number; startupTimeoutMs?: number; timeoutMs?: number; readLines?: number; configCwd?: string; toolCallId?: string;
 };
 
 export function parseModelCatalog(output: string): string[] {
@@ -469,13 +545,19 @@ export function modelMatch(requested: string, catalog: string[]): "exact" | "fuz
   }) ? "fuzzy" : "none";
 }
 
-async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, signal?: AbortSignal, onUpdate?: ToolUpdate) {
+async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, signal?: AbortSignal, onUpdate?: ToolUpdate, ctx?: ExtensionContext) {
   const roleName = params.role ?? "scout";
   assertValidRoleName(roleName);
   const task = normalizeTask(params.task, params);
+  const command = normalizeCommand(params.command);
   const startupTimeoutMs = positiveInteger(params.startupTimeoutMs, STARTUP_TIMEOUT_MS, "startupTimeoutMs");
   const timeoutMs = positiveInteger(params.timeoutMs, PROMPT_TIMEOUT_MS, "timeoutMs");
   const readLines = positiveInteger(params.readLines, DEFAULT_READ_LINES, "readLines");
+  const contextMode = params.contextMode ?? "since-last-crew";
+  const fallback = params.checkpointFallback ?? "recent";
+  const recentTurns = positiveInteger(params.recentTurns, 6, "recentTurns");
+  const maxHandoffChars = positiveInteger(params.maxHandoffChars, 24_000, "maxHandoffChars");
+  const handoff = contextMode === "since-last-crew" && ctx && params.toolCallId ? buildHandoff(ctx.sessionManager.getBranch(), params.toolCallId, contextMode, fallback, recentTurns, maxHandoffChars, params.context) : undefined;
   const current = await functionalPreflight(pi);
   expectOk(current, "herdr pane current");
   const currentPane = parseJson(current.stdout, "herdr pane current").result?.pane;
@@ -487,9 +569,11 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   const { config, path: configPath } = loadCrewConfig(params.configCwd ?? roleCwd);
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
-  const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, params);
+  const source = ctx?.sessionManager.getLeafId() && ctx.sessionManager.getSessionId() ? { version: 1 as const, brainSessionId: ctx.sessionManager.getSessionId(), checkpointEntryId: handoff?.checkpointEntryId, upperBoundEntryId: ctx.sessionManager.getLeafId()! } : undefined;
+  const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, { ...params, context: handoff?.text || params.context, contextMode, sourceLocator: source ? sourceLocatorBlock(source) : undefined });
+  const commandPrompt = command ? `${basePrompt}\n\n## Required Pi command\nExecute this native Pi slash command in this role session before producing the final response:\n${command}` : basePrompt;
   const markers = buildCrewMarkers(params.toolCallId ?? "crew_launch");
-  const prompt = appendMarkerInstruction(basePrompt, markers);
+  const prompt = appendMarkerInstruction(commandPrompt, markers);
   const baseCommand = selectLaunchCommand();
   const launchModel = role.model;
   if (launchModel) {
@@ -611,7 +695,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   const agentContinues = status === "working" || status === "timed_out" || status === "blocked" || status === "unknown";
 
   const compactOutput = complete && markerOutput.text
-    ? boundedLines(markerOutput.text, readLines)
+    ? markerOutput.text
     : `[CREW STATUS: ${status}; complete: false] ${settled ? "The role settled without a confirmed final marker pair; this is incomplete diagnostic output, not a final answer." : "The role did not complete. This is partial diagnostic output, not a final answer."}\n\n${compactRoleOutput(output, prompt, readLines)}`;
   return {
     content: [{ type: "text", text: compactOutput }],
@@ -646,6 +730,14 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
       outputLineCount: output.split(/\r?\n/).filter(Boolean).length,
       markerCaptureLines: Math.max(readLines, MARKER_READ_LINES),
       compactOutputLineCount: compactOutput.split(/\r?\n/).filter(Boolean).length,
+      contextMode,
+      contextSourceIncluded: !!source,
+      brainSessionId: source?.brainSessionId ?? null,
+      checkpointEntryId: handoff?.checkpointEntryId ?? null,
+      upperBoundEntryId: source?.upperBoundEntryId ?? null,
+      handoffEntryCount: handoff?.entries.length ?? 0,
+      handoffCharCount: handoff?.text.length ?? 0,
+      checkpointFallbackUsed: handoff?.fallbackUsed ?? false,
     },
   };
 }
@@ -687,18 +779,32 @@ async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) 
 export default function crewExtension(pi: ExtensionAPI) {
   const parameters = { type: "object", required: ["role", "task"], properties: {
     role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
+    command: { type: "string", description: "Optional single native Pi slash command to execute in the target role session, such as /openspec-propose. Not a shell command; include the leading slash." },
     task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
     context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
     acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
-    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, configCwd: { type: "string", description: "Explicit config lookup override." },
+    startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, contextMode: { type: "string", enum: ["explicit", "since-last-crew"] }, checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"] }, recentTurns: { type: "number" }, maxHandoffChars: { type: "number" }, configCwd: { type: "string", description: "Explicit config lookup override." },
   }, additionalProperties: false };
-  const execute = async (toolCallId: string, rawParams: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate) => {
+  const execute = async (toolCallId: string, rawParams: unknown, signal?: AbortSignal, onUpdate?: ToolUpdate, ctx?: ExtensionContext) => {
     const params = { ...((rawParams ?? {}) as CrewLaunchParams), toolCallId };
     const authority = DEFAULT_ROLES[params.role ?? "scout"]?.authority ?? (params.configCwd ? resolveRole(params.role ?? "scout", loadCrewConfig(params.configCwd).config).authority : "can-edit");
     const key = authority === "read-only" ? `readonly:${normalizedCwd(params.configCwd ?? process.cwd())}:${Date.now()}:${Math.random()}` : `writer:${params.configCwd ? normalizedCwd(params.configCwd) : "pane"}`;
-    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate));
+    return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate, ctx));
   };
-  pi.registerTool({ name: "crew_launch", label: "Crew Launch", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
+  pi.registerTool({ name: "crew_launch", label: "Crew Launch", executionMode: "sequential", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
+  pi.registerTool({ name: "crew_read_context", label: "Crew Read Context", description: "Read a bounded older passage from the invoking brain session.", parameters: { type: "object", required: ["mode"], properties: { mode: { type: "string", enum: ["search", "entry", "around"] }, query: { type: "string" }, entryId: { type: "string" }, maxChars: { type: "number" } }, additionalProperties: false }, async execute(_id, raw, _signal, _update, roleCtx) {
+    if (!roleCtx) throw new Error("crew_read_context is unavailable without native session context");
+    const prompt = [...roleCtx.sessionManager.getBranch()].reverse().find(e => parseSource(messageText(e.message))); const source = prompt ? parseSource(messageText(prompt.message)) : undefined; if (!source) throw new Error("No valid crew context source locator found");
+    const path = readdirSync(roleCtx.sessionManager.getSessionDir()).map(name => join(roleCtx.sessionManager.getSessionDir(), name)).find(name => name.includes(source.brainSessionId)); if (!path) throw new Error("Invoking brain session could not be resolved");
+    const native = parseJsonlSession(readFileSync(path, "utf8")); if (native.sessionId !== source.brainSessionId) throw new Error("Brain session header ID mismatch"); const branch = reconstructBranch(native.entries, source.upperBoundEntryId); const checkpoint = source.checkpointEntryId ? branch.findIndex(e => e.id === source.checkpointEntryId) : branch.length; if (checkpoint < 0) throw new Error("Checkpoint is not on the frozen branch");
+    const p = (raw ?? {}) as { mode?: string; query?: string; entryId?: string; maxChars?: number };
+    const latestPrompt = [...roleCtx.sessionManager.getBranch()].reverse().findIndex(e => !!parseSource(messageText(e.message))); const afterPrompt = latestPrompt < 0 ? [] : roleCtx.sessionManager.getBranch().slice(roleCtx.sessionManager.getBranch().length - latestPrompt - 1);
+    const priorReads = afterPrompt.filter(e => e.message?.role === "toolResult" && e.message.toolName === "crew_read_context"); const usedChars = priorReads.reduce((sum, e) => sum + (typeof e.message?.details?.returnedChars === "number" ? e.message.details.returnedChars : 0), 0);
+    if (priorReads.length >= 4 || usedChars >= 24_000) throw new Error(`crew_read_context budget exhausted: ${priorReads.length} calls, ${usedChars} characters used`);
+    const limit = Math.min(p.maxChars ?? 6000, 8000, 24_000 - usedChars); if (!Number.isInteger(limit) || limit < 1) throw new Error("maxChars must be a positive integer"); const prior = branch.slice(0, checkpoint); let selected: SessionEntryLike[];
+    if (p.mode === "search") { if (!p.query?.trim()) throw new Error("search requires a non-blank query"); selected = prior.filter(e => messageText(e.message).toLocaleLowerCase().includes(p.query!.toLocaleLowerCase())).slice(0, 20); } else { if (!p.entryId) throw new Error("entryId is required"); const i = prior.findIndex(e => e.id === p.entryId); if (i < 0) throw new Error("entryId is outside the allowed range"); selected = p.mode === "around" ? prior.slice(Math.max(0, i - 2), i + 3) : [prior[i]]; }
+    const full = serializeSessionEntries(selected); const text = full.slice(0, limit); return { content: [{ type: "text", text }], details: { sourceBrainSessionId: source.brainSessionId, sourceCheckpointEntryId: source.checkpointEntryId ?? null, sourceUpperBoundEntryId: source.upperBoundEntryId, mode: p.mode, matchedEntryIds: selected.map(e => e.id).filter((id): id is string => !!id), returnedChars: text.length, remainingChars: full.length - text.length, remainingCalls: Math.max(0, 3 - priorReads.length), truncated: text.length < full.length, nextCursor: text.length < full.length ? "0" : null } };
+  } });
 
 
   pi.registerTool({
