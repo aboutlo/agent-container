@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -6,7 +6,7 @@ type ExecResult = { code: number | null; stdout: string; stderr: string; killed?
 type ToolResult = { content: Array<{ type: "text"; text: string }>; details?: unknown };
 type ToolUpdate = (partialResult: ToolResult) => void;
 type SessionMessage = { role?: string; toolName?: string; toolCallId?: string; isError?: boolean; content?: unknown; details?: Record<string, unknown> };
-type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; timestamp?: string; message?: SessionMessage };
+export type SessionEntryLike = { id?: string; parentId?: string | null; type?: string; timestamp?: string; message?: SessionMessage; customType?: string; content?: unknown };
 type ExtensionContext = { cwd: string; sessionManager: { getBranch(): SessionEntryLike[]; getLeafId(): string | null; getSessionFile(): string | undefined; getSessionId(): string; getSessionDir(): string } };
 
 type ExtensionAPI = {
@@ -82,8 +82,9 @@ export function selectLaunchCommand(env: NodeJS.ProcessEnv = process.env): "pic-
 
 export function selectDiscoveryCommand(): "pi" { return "pi"; }
 
-export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string): string {
-  return `${baseCommand} --approve${launchModel ? ` --model ${launchModel}` : ""}`;
+function shellQuote(value: string): string { return /^[A-Za-z0-9._:/~-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`; }
+export function buildRoleCommand(baseCommand: "pic-proxy" | "pi", launchModel?: string, sessionDir?: string): string {
+  return `${baseCommand} --approve${launchModel ? ` --model ${shellQuote(launchModel)}` : ""}${sessionDir ? ` --session-dir ${shellQuote(sessionDir)}` : ""}`;
 }
 
 export function parseCrewConfig(raw: string): CrewConfig {
@@ -136,6 +137,10 @@ function assertValidModel(model: unknown, roleName: string): asserts model is st
   }
 }
 
+export function assertValidSessionId(id: string): void {
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) throw new Error("Invalid session ID");
+}
+
 function assertValidRoleName(roleName: string): void {
   if (!/^[a-z][a-z0-9_-]{0,31}$/.test(roleName)) {
     throw new Error("crew_launch role must match Herdr agent names: lowercase letter followed by lowercase letters, numbers, underscore, or hyphen; max 32 chars");
@@ -165,8 +170,15 @@ export type DelegationFields = { context?: string; constraints?: string; accepta
 
 export type ContextMode = "explicit" | "since-last-crew";
 export type CheckpointFallback = "recent" | "explicit" | "error";
-export type CrewContextSource = { version: 1; brainSessionId: string; checkpointEntryId?: string; upperBoundEntryId: string };
-export type CrewLaunchContext = { text: string; entries: SessionEntryLike[]; source?: CrewContextSource; checkpointEntryId?: string; fallbackUsed: boolean };
+export type CrewContextSource = { version: 1; brainSessionId: string; checkpointEntryId?: string; retrievalCutoffEntryId?: string; upperBoundEntryId: string };
+export type HandoffSelection = {
+  automaticText?: string;
+  entries: SessionEntryLike[];
+  semanticCheckpointEntryId?: string;
+  retrievalCutoffEntryId?: string;
+  fallbackUsed?: CheckpointFallback;
+};
+export type CrewLaunchContext = HandoffSelection & { text: string; source?: CrewContextSource; checkpointEntryId?: string };
 
 function messageText(message: SessionMessage | undefined): string {
   if (!message) return "";
@@ -179,28 +191,29 @@ function messageText(message: SessionMessage | undefined): string {
     const part = item as { type?: string; text?: unknown; name?: unknown; id?: unknown };
     if (part.type === "thinking" || part.type === "thinkingSignature") return [];
     if (part.type === "text" && typeof part.text === "string") return [part.text];
-    if (part.type === "toolCall") return [];
+    if (part.type === "toolCall") return [`[tool call: ${typeof part.name === "string" ? part.name : "unknown"}${typeof part.id === "string" ? ` id=${part.id}` : ""}]`];
     return [`[attachment: ${part.type ?? "unsupported content"}]`];
   }).join("\n");
 }
-function eligibleEntry(entry: SessionEntryLike): boolean { return entry.type === "message" && !!entry.message && ["user", "assistant", "toolResult", "custom"].includes(entry.message.role ?? ""); }
+function eligibleEntry(entry: SessionEntryLike): boolean { return (entry.type === "message" && !!entry.message && ["user", "assistant", "toolResult", "custom"].includes(entry.message.role ?? "")) || entry.type === "custom_message"; }
+function entryText(entry: SessionEntryLike): string { return entry.type === "custom_message" ? (typeof entry.content === "string" ? entry.content : `[custom attachment: ${entry.customType ?? "unknown"}]`) : messageText(entry.message); }
 
 export function selectHandoffEntries(entries: SessionEntryLike[]): SessionEntryLike[] {
   return entries.filter((entry) => {
     if (!eligibleEntry(entry)) return false;
-    const message = entry.message!;
-    // Crew results are semantic checkpoints and must remain verbatim. Ordinary provider/tool
-    // payloads include terminal/TUI output and runtime diagnostics, so omit them from the
-    // normal handoff. Older detail remains available through bounded native-session reads.
-    return message.role !== "toolResult" || message.toolName === "crew_launch";
+    if (entry.type === "custom_message") return true;
+    const message = entry.message;
+    if (!message || message.role !== "toolResult" || message.toolName === "crew_launch") return true;
+    const callIds = new Set(entries.flatMap(item => Array.isArray(item.message?.content) ? item.message.content.flatMap(part => part && typeof part === "object" && (part as { type?: string }).type === "toolCall" && typeof (part as { id?: string }).id === "string" ? [(part as { id: string }).id] : []) : []));
+    return typeof message.toolCallId === "string" && callIds.has(message.toolCallId);
   });
 }
 export function serializeSessionEntries(entries: SessionEntryLike[]): string {
   return entries.filter(eligibleEntry).flatMap((entry) => {
-    const message = entry.message!;
-    const text = messageText(message).trim();
+    const text = entryText(entry);
     if (!text) return [];
-    const label = message.role === "toolResult" ? "crew result" : message.role ?? "message";
+    const message = entry.message;
+    const label = entry.type === "custom_message" ? `custom${entry.customType ? `:${entry.customType}` : ""}` : message?.role === "toolResult" ? `toolResult ${message.toolName ?? "unknown"}${message.toolCallId ? ` (${message.toolCallId})` : ""}` : message?.role ?? "message";
     return [`[${label}]\n${text}`];
   }).join("\n\n");
 }
@@ -208,28 +221,86 @@ export function findCurrentCrewLaunch(branch: SessionEntryLike[], toolCallId: st
 export function findCheckpoint(branch: SessionEntryLike[], beforeIndex: number): SessionEntryLike | undefined { for (let i = beforeIndex - 1; i >= 0; i -= 1) { const m = branch[i].message; if (m?.role === "toolResult" && m.toolName === "crew_launch" && m.isError === false && m.details?.complete === true) return branch[i]; } return undefined; }
 function userBoundaryIndex(branch: SessionEntryLike[], end: number, turns: number): number { let seen = 0; for (let i = end - 1; i >= 0; i -= 1) if (branch[i].message?.role === "user" && ++seen >= turns) return i; return 0; }
 export function buildHandoff(branch: SessionEntryLike[], toolCallId: string, mode: ContextMode = "since-last-crew", fallback: CheckpointFallback = "recent", recentTurns = 6, maxChars = 24_000, explicitText = ""): CrewLaunchContext {
-  if (mode === "explicit") return { text: explicitText, entries: [], fallbackUsed: false };
+  if (mode === "explicit") return { text: explicitText, entries: [] };
   const current = findCurrentCrewLaunch(branch, toolCallId); if (!current) throw new Error(`Cannot build crew handoff: current crew_launch tool call ${toolCallId} was not found in the active branch.`);
-  const end = branch.indexOf(current); const checkpoint = findCheckpoint(branch, end);
-  if (!checkpoint && fallback === "error") throw new Error("Cannot build crew handoff: no successful complete crew_launch checkpoint exists in the active branch.");
-  const start = checkpoint ? branch.indexOf(checkpoint) : userBoundaryIndex(branch, end, recentTurns); const entries = selectHandoffEntries(branch.slice(start, end)); const text = serializeSessionEntries(entries);
+  const end = branch.findIndex(e => e.id === current.id); const checkpoint = findCheckpoint(branch, end);
+  if (!checkpoint) {
+    if (fallback === "error") throw new Error("Cannot build crew handoff: no successful complete crew_launch checkpoint exists in the active branch.");
+    if (fallback === "explicit") return { text: explicitText, entries: [], fallbackUsed: "explicit" };
+  }
+  const boundary = checkpoint ?? branch[userBoundaryIndex(branch, end, recentTurns)];
+  const start = branch.findIndex(e => e.id === boundary?.id); const entries = selectHandoffEntries(branch.slice(start, end)); const text = serializeSessionEntries(entries);
   if (text.length > maxChars) throw new Error(`Crew handoff exceeds maxHandoffChars: ${entries.length} entries, ${text.length} characters (limit ${maxChars}).`);
-  return { text, entries, checkpointEntryId: checkpoint?.id, fallbackUsed: !checkpoint };
+  return { text, automaticText: text, entries, semanticCheckpointEntryId: checkpoint?.id, checkpointEntryId: checkpoint?.id, retrievalCutoffEntryId: boundary?.id, fallbackUsed: checkpoint ? undefined : "recent" };
 }
 export function sourceLocatorBlock(source: CrewContextSource): string { return `<crew-context-source>\n${JSON.stringify(source)}\n</crew-context-source>`; }
-function parseSource(text: string): CrewContextSource | undefined { const match = text.match(/<crew-context-source>\s*([\s\S]*?)\s*<\/crew-context-source>/); if (!match) return undefined; try { const value = JSON.parse(match[1]) as CrewContextSource; return value.version === 1 && typeof value.brainSessionId === "string" && typeof value.upperBoundEntryId === "string" ? value : undefined; } catch { return undefined; } }
-export function parseJsonlSession(raw: string): { sessionId: string; entries: SessionEntryLike[] } { const lines = raw.split(/\r?\n/).filter(Boolean); if (!lines.length) throw new Error("Native session is empty"); const parsed: unknown[] = []; for (let i = 0; i < lines.length; i += 1) { try { parsed.push(JSON.parse(lines[i])); } catch { if (i !== lines.length - 1) throw new Error(`Malformed native session JSONL at line ${i + 1}`); } } const header = parsed[0] as { type?: string; id?: string; sessionId?: string; session_id?: string } | undefined; const sessionId = header?.sessionId ?? header?.session_id ?? header?.id; if (header?.type !== "session" || typeof sessionId !== "string") throw new Error("Native session has an invalid header"); return { sessionId, entries: parsed.slice(1) as SessionEntryLike[] }; }
-export function reconstructBranch(entries: SessionEntryLike[], upperBoundId: string): SessionEntryLike[] { const byId = new Map(entries.filter(e => typeof e.id === "string").map(e => [e.id!, e])); const chain: SessionEntryLike[] = []; let cursor: SessionEntryLike | undefined = byId.get(upperBoundId); if (!cursor) throw new Error(`upperBoundEntryId ${upperBoundId} was not found in the native session`); while (cursor) { chain.push(cursor); cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined; } return chain.reverse(); }
+function parseSource(text: string): CrewContextSource | undefined {
+  const matches = [...text.matchAll(/<crew-context-source>\s*([\s\S]*?)\s*<\/crew-context-source>/g)];
+  const raw = matches.at(-1)?.[1]; if (!raw) return undefined;
+  try { const value = JSON.parse(raw) as CrewContextSource; if (value.version !== 1 || !/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value.brainSessionId) || !/^[A-Za-z0-9_-]{1,256}$/.test(value.upperBoundEntryId)) return undefined; if (value.checkpointEntryId !== undefined && !/^[A-Za-z0-9_-]{1,256}$/.test(value.checkpointEntryId)) return undefined; if (value.retrievalCutoffEntryId !== undefined && !/^[A-Za-z0-9_-]{1,256}$/.test(value.retrievalCutoffEntryId)) return undefined; return value; } catch { return undefined; }
+}
+function isPromptStructure(entry: SessionEntryLike): boolean {
+  if (entry.type !== "message" || entry.message?.role !== "user") return false;
+  const text = messageText(entry.message);
+  const normalized = text.replace(/^<crew-delegation version="1">\s*/, "");
+  return normalized.startsWith("You are ") && ["## Role", "## Authority", "## Working directory", "## Objective", "## Context", "## Constraints", "## Acceptance criteria", "## Required response"].every(section => normalized.includes(section));
+}
+function isGeneratedDelegationPrompt(entry: SessionEntryLike): boolean { return isPromptStructure(entry) && messageText(entry.message).includes('<crew-delegation version="1">'); }
+function generatedSource(entry: SessionEntryLike): CrewContextSource | undefined { return isGeneratedDelegationPrompt(entry) ? parseSource(messageText(entry.message)) : undefined; }
+export function findLatestDelegationPrompt(branch: SessionEntryLike[]): SessionEntryLike | undefined { return [...branch].reverse().find(isGeneratedDelegationPrompt); }
+export function parseJsonlSession(raw: string): { sessionId: string; entries: SessionEntryLike[] } {
+  const endsWithNewline = /\r?\n$/.test(raw);
+  const lines = raw.split(/\r?\n/);
+  if (endsWithNewline) lines.pop();
+  if (!lines.length || (lines.length === 1 && !lines[0])) throw new Error("Native session is empty");
+  const parsed: unknown[] = [];
+  lines.forEach((line, index) => { try { parsed.push(JSON.parse(line)); } catch { if (!endsWithNewline && index === lines.length - 1) return; throw new Error(`Malformed native session JSONL at line ${index + 1}`); } });
+  const header = parsed[0];
+  if (!header || typeof header !== "object") throw new Error("Native session has an invalid header");
+  const h = header as { type?: unknown; id?: unknown; sessionId?: unknown; session_id?: unknown };
+  const sessionId = h.sessionId ?? h.session_id ?? h.id;
+  if (h.type !== "session" || typeof sessionId !== "string") throw new Error("Native session has an invalid header");
+  assertValidSessionId(sessionId);
+  const entries = parsed.slice(1) as SessionEntryLike[];
+  const ids = new Set<string>();
+  for (const entry of entries) { if (!entry || typeof entry !== "object" || typeof entry.id !== "string" || ids.has(entry.id)) throw new Error("Native session contains an invalid or duplicate entry ID"); ids.add(entry.id); }
+  return { sessionId, entries };
+}
 
-export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields & { contextMode?: ContextMode; sourceLocator?: string } = {}): string {
+export function resolveNativeSessionPath(sessionDir: string, sessionId: string): string {
+  assertValidSessionId(sessionId);
+  const directory = resolve(sessionDir);
+  const candidates = readdirSync(directory).filter(name => name.endsWith(`_${sessionId}.jsonl`));
+  if (candidates.length !== 1) throw new Error("Invoking brain session could not be resolved unambiguously");
+  const path = resolve(directory, candidates[0]);
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink()) throw new Error("Native session candidate is a symlink");
+  if (!stat.isFile()) throw new Error("Native session candidate is not a regular file");
+  const realDirectory = realpathSync(directory); const realPath = realpathSync(path);
+  if (dirname(realPath) !== realDirectory) throw new Error("Native session candidate escapes the session directory");
+  if (parseJsonlSession(readFileSync(realPath, "utf8")).sessionId !== sessionId) throw new Error("Brain session header ID mismatch");
+  return realPath;
+}
+export function reconstructBranch(entries: SessionEntryLike[], upperBoundId: string): SessionEntryLike[] {
+  const byId = new Map<string, SessionEntryLike>();
+  for (const entry of entries) { if (!entry.id || byId.has(entry.id)) throw new Error("Native session contains duplicate or missing entry IDs"); byId.set(entry.id, entry); }
+  const chain: SessionEntryLike[] = []; const visited = new Set<string>(); let cursor = byId.get(upperBoundId);
+  if (!cursor) throw new Error(`upperBoundEntryId ${upperBoundId} was not found in the native session`);
+  while (cursor) { if (!cursor.id || visited.has(cursor.id)) throw new Error("Native session branch contains a cycle"); visited.add(cursor.id); chain.push(cursor); if (!cursor.parentId) break; cursor = byId.get(cursor.parentId); if (!cursor) throw new Error("Native session branch has a missing parent"); }
+  return chain.reverse();
+}
+
+export function buildRolePrompt(roleName: string, role: Role, task: string, cwd = process.cwd(), fields: DelegationFields & { contextMode?: ContextMode; sourceLocator?: string; handoffText?: string } = {}): string {
   const automatic = fields.contextMode === "since-last-crew";
   return [
-    `You are ${roleName}.${role.description ? ` ${role.description}` : ""} Authority: ${role.authority ?? "unspecified"}. Task: ${task}`,
+    '<crew-delegation version="1">',
+    `You are ${roleName}.${role.description ? ` ${role.description}` : ""} Authority: ${role.authority ?? "unspecified"}. Task: ${task}`, 
     `## Role\n${roleName}${role.description ? `\n${role.description}` : ""}`,
     `## Authority\n${role.authority === "read-only" ? "read-only\nDo not create, modify, rename, or delete files, and do not run mutating commands." : role.authority === "can-edit" ? "can-edit\nModify only the requested scope; do not make unrelated changes." : "unspecified"}`, 
     `## Working directory\n${cwd}`,
     `## Objective\n${task}`,
-    `## Context\n${fields.context ? (automatic ? `## Brain handoff (verbatim)\n~~~text\n${fields.context}\n~~~\n## End brain handoff` : fields.context) : "No additional context supplied."}`, 
+    `## Context\n${fields.context || "No additional context supplied."}`,
+    ...(fields.handoffText ? [`## Brain handoff (verbatim)\n~~~text\n${fields.handoffText}\n~~~\n## End brain handoff`] : []), 
     `## Constraints\n${fields.constraints || "Follow repository conventions and do not exceed the requested scope."}`,
     `## Acceptance criteria\n${fields.acceptanceCriteria || "Explain what you checked and identify any remaining uncertainty."}`,
     `## Required response\n${fields.expectedOutput || "Return a concise summary of findings or changes, validation performed, and remaining risks."}`,
@@ -265,7 +336,7 @@ export function extractMarkerOutput(output: string, markers: { start: string; en
     const endOffset = lines.slice(startLine + 1).findIndex(line => line.trim() === markers.end);
     if (endOffset >= 0) {
       const endLine = startLine + 1 + endOffset;
-      return { text: boundedLines(lines.slice(startLine + 1, endLine).join("\n"), maxLines), mode: "marker-pair" };
+      return { text: lines.slice(startLine + 1, endLine).join("\n"), mode: "marker-pair" };
     }
     return { text: boundedLines(lines.slice(startLine + 1).join("\n"), maxLines), mode: "marker-start" };
   }
@@ -295,7 +366,7 @@ export function updateMarkerOutput(previous: MarkerOutput, snapshot: string, mar
   const endLine = lines.findIndex(line => line.trim() === markers.end);
   const continuation = (endLine >= 0 ? lines.slice(0, endLine) : lines).join("\n");
   return {
-    text: mergeOverlappingText(previous.text, continuation).trim(),
+    text: mergeOverlappingText(previous.text, continuation),
     mode: endLine >= 0 ? "marker-pair" : "marker-start",
   };
 }
@@ -557,7 +628,8 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   const fallback = params.checkpointFallback ?? "recent";
   const recentTurns = positiveInteger(params.recentTurns, 6, "recentTurns");
   const maxHandoffChars = positiveInteger(params.maxHandoffChars, 24_000, "maxHandoffChars");
-  const handoff = contextMode === "since-last-crew" && ctx && params.toolCallId ? buildHandoff(ctx.sessionManager.getBranch(), params.toolCallId, contextMode, fallback, recentTurns, maxHandoffChars, params.context) : undefined;
+  const handoff = ctx && params.toolCallId ? buildHandoff(ctx.sessionManager.getBranch(), params.toolCallId, contextMode, fallback, recentTurns, maxHandoffChars, params.context) : undefined;
+  const effectiveAutomatic = contextMode === "since-last-crew" && handoff?.fallbackUsed !== "explicit";
   const current = await functionalPreflight(pi);
   expectOk(current, "herdr pane current");
   const currentPane = parseJson(current.stdout, "herdr pane current").result?.pane;
@@ -569,9 +641,10 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
   const { config, path: configPath } = loadCrewConfig(params.configCwd ?? roleCwd);
   const roleNames = new Set([...Object.keys(DEFAULT_ROLES), ...Object.keys(config.roles ?? {})]);
   const role = resolveRole(roleName, config);
-  const source = ctx?.sessionManager.getLeafId() && ctx.sessionManager.getSessionId() ? { version: 1 as const, brainSessionId: ctx.sessionManager.getSessionId(), checkpointEntryId: handoff?.checkpointEntryId, upperBoundEntryId: ctx.sessionManager.getLeafId()! } : undefined;
-  const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, { ...params, context: handoff?.text || params.context, contextMode, sourceLocator: source ? sourceLocatorBlock(source) : undefined });
-  const commandPrompt = command ? `${basePrompt}\n\n## Required Pi command\nExecute this native Pi slash command in this role session before producing the final response:\n${command}` : basePrompt;
+  const source = effectiveAutomatic && ctx?.sessionManager.getSessionFile() && ctx.sessionManager.getLeafId() && ctx.sessionManager.getSessionId() ? { version: 1 as const, brainSessionId: ctx.sessionManager.getSessionId(), checkpointEntryId: handoff?.semanticCheckpointEntryId, retrievalCutoffEntryId: handoff?.retrievalCutoffEntryId, upperBoundEntryId: ctx.sessionManager.getLeafId()! } : undefined;
+  const basePrompt = buildRolePrompt(roleName, role, task, roleCwd, { ...params, context: params.context, handoffText: effectiveAutomatic ? handoff?.automaticText : undefined, contextMode: effectiveAutomatic ? "since-last-crew" : "explicit", sourceLocator: source ? sourceLocatorBlock(source) : undefined });
+  // Native slash-command execution is intentionally not exposed until Herdr can submit a separate input.
+  const commandPrompt = basePrompt;
   const markers = buildCrewMarkers(params.toolCallId ?? "crew_launch");
   const prompt = appendMarkerInstruction(commandPrompt, markers);
   const baseCommand = selectLaunchCommand();
@@ -584,7 +657,7 @@ async function executeCrewLaunch(pi: ExtensionAPI, params: CrewLaunchParams, sig
       throw new Error(`Configured model ${launchModel} is not an exact match in the launch catalog.${nearby.length ? ` Nearby matches: ${nearby.join(", ")}` : " No nearby matches found."}`);
     }
   }
-  const roleCommand = buildRoleCommand(baseCommand, launchModel);
+  const roleCommand = buildRoleCommand(baseCommand, launchModel, ctx?.sessionManager.getSessionFile() ? ctx.sessionManager.getSessionDir() : undefined);
 
   let agents = await listAgents(pi);
   let agentName = chooseAgentName(agents, roleName, workspaceId, roleCwd, tabId, role.model);
@@ -776,10 +849,41 @@ async function executeCrewRules(pi: ExtensionAPI, params: CrewRulesParams = {}) 
   };
 }
 
+export type ReadContextParams = { mode?: string; query?: string; entryId?: string; maxChars?: number; cursor?: string };
+export function encodeCursor(value: unknown): string { return Buffer.from(JSON.stringify(value), "utf8").toString("base64url"); }
+export function decodeCursor(value: string): any { try { const parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); if (!parsed || typeof parsed !== "object") throw new Error(); return parsed; } catch { throw new Error("Invalid cursor"); } }
+export function calculateReadBudget(priorCount: number, usedChars: number, returnedChars: number): { remainingChars: number; remainingCalls: number } {
+  return { remainingChars: 24_000 - usedChars - returnedChars, remainingCalls: 4 - priorCount - 1 };
+}
+export function selectReadableEntries(entries: SessionEntryLike[]): SessionEntryLike[] { return entries.filter(e => eligibleEntry(e) && !!entryText(e)); }
+export function searchContext(entries: SessionEntryLike[], query: string, maxHits = 20): SessionEntryLike[] { const q = query.toLocaleLowerCase(); return entries.filter(e => entryText(e).toLocaleLowerCase().includes(q)).slice(0, maxHits); }
+export function readContextEntry(entries: SessionEntryLike[], id: string): SessionEntryLike { const e = entries.find(x => x.id === id && eligibleEntry(x)); if (!e) throw new Error("entryId is outside the allowed range"); return e; }
+export function readContextAround(entries: SessionEntryLike[], id: string, radius = 2): SessionEntryLike[] { const i = entries.findIndex(x => x.id === id); if (i < 0 || !eligibleEntry(entries[i])) throw new Error("entryId is outside the allowed range"); return entries.slice(Math.max(0, i-radius), i+radius+1).filter(eligibleEntry); }
+export function findLatestDelegationContext(branch: SessionEntryLike[]): { prompt: SessionEntryLike; source: CrewContextSource } {
+  const prompt = [...branch].reverse().find(isPromptStructure); const source = prompt && isGeneratedDelegationPrompt(prompt) ? generatedSource(prompt) : undefined;
+  if (!prompt || !source) throw new Error("No valid crew context source locator found");
+  return { prompt, source };
+}
+function readContextParameters() { return { type: "object", required: ["mode"], properties: { mode: { type: "string", enum: ["search", "entry", "around"] }, query: { type: "string" }, entryId: { type: "string" }, maxChars: { type: "number" }, cursor: { type: "string" } }, additionalProperties: false }; }
+async function executeReadContext(p: ReadContextParams, roleCtx: ExtensionContext) {
+  const roleBranch = roleCtx.sessionManager.getBranch(); const { prompt, source } = findLatestDelegationContext(roleBranch);
+  const native = parseJsonlSession(readFileSync(resolveNativeSessionPath(roleCtx.sessionManager.getSessionDir(), source.brainSessionId), "utf8"));
+  const branch = reconstructBranch(native.entries, source.upperBoundEntryId); const cutoffId = source.retrievalCutoffEntryId ?? source.checkpointEntryId;
+  const cutoff = cutoffId ? branch.findIndex(e => e.id === cutoffId) : branch.length; if (cutoff < 0) throw new Error("Retrieval cutoff is not on the frozen branch");
+  const promptIndex = branch.findIndex(e => e.id === prompt.id); const readable = selectReadableEntries(branch.slice(0, Math.min(cutoff, promptIndex < 0 ? cutoff : promptIndex))); if (source.retrievalCutoffEntryId && !branch.some(e => e.id === source.retrievalCutoffEntryId)) throw new Error("Retrieval cutoff is not on the frozen branch");
+  const after = roleBranch.slice(roleBranch.findIndex(e => e.id === prompt.id) + 1); const reads = after.filter(e => e.message?.role === "toolResult" && e.message.toolName === "crew_read_context");
+  const used = reads.reduce((n, e) => n + (typeof e.message?.details?.returnedChars === "number" ? e.message.details.returnedChars : 0), 0); const priorCount = reads.length;
+  if (priorCount >= 4 || used >= 24_000) throw new Error("crew_read_context budget exhausted");
+  const limit = p.maxChars === undefined ? 6000 : p.maxChars; if (!Number.isInteger(limit) || limit < 1 || limit > 8000) throw new Error("maxChars must be an integer from 1 through 8000");
+  let selected: SessionEntryLike[]; if (p.cursor) { const c = decodeCursor(p.cursor); if (c.source !== source.upperBoundEntryId || c.mode !== p.mode) throw new Error("Invalid cursor"); selected = readable.slice(Number(c.nextIndex)); } else if (p.mode === "search") { if (!p.query?.trim()) throw new Error("search requires a non-blank query"); selected = searchContext(readable, p.query); } else { if (!p.entryId) throw new Error("entryId is required"); selected = p.mode === "around" ? readContextAround(readable, p.entryId) : [readContextEntry(readable, p.entryId)]; }
+  const full = serializeSessionEntries(selected); const text = full.length <= limit ? full : full.slice(0, limit); const budget = calculateReadBudget(priorCount, used, text.length); const nextIndex = (p.cursor ? Number(decodeCursor(p.cursor).nextIndex) : 0) + Math.max(1, selected.length);
+  return { content: [{ type: "text", text }], details: { sourceBrainSessionId: source.brainSessionId, sourceUpperBoundEntryId: source.upperBoundEntryId, mode: p.mode, matchedEntryIds: selected.map(e => e.id).filter(Boolean), returnedChars: text.length, remainingChars: budget.remainingChars, remainingCalls: budget.remainingCalls, nextCursor: nextIndex < readable.length ? encodeCursor({ version: 1, source: source.upperBoundEntryId, mode: p.mode, nextIndex }) : undefined } };
+}
+
 export default function crewExtension(pi: ExtensionAPI) {
   const parameters = { type: "object", required: ["role", "task"], properties: {
     role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
-    command: { type: "string", description: "Optional single native Pi slash command to execute in the target role session, such as /openspec-propose. Not a shell command; include the leading slash." },
+
     task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
     context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
     acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
@@ -792,18 +896,9 @@ export default function crewExtension(pi: ExtensionAPI) {
     return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate, ctx));
   };
   pi.registerTool({ name: "crew_launch", label: "Crew Launch", executionMode: "sequential", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
-  pi.registerTool({ name: "crew_read_context", label: "Crew Read Context", description: "Read a bounded older passage from the invoking brain session.", parameters: { type: "object", required: ["mode"], properties: { mode: { type: "string", enum: ["search", "entry", "around"] }, query: { type: "string" }, entryId: { type: "string" }, maxChars: { type: "number" } }, additionalProperties: false }, async execute(_id, raw, _signal, _update, roleCtx) {
+  pi.registerTool({ name: "crew_read_context", label: "Crew Read Context", description: "Read a bounded older passage from the invoking brain session.", parameters: readContextParameters(), async execute(_id, raw, _signal, _update, roleCtx) {
     if (!roleCtx) throw new Error("crew_read_context is unavailable without native session context");
-    const prompt = [...roleCtx.sessionManager.getBranch()].reverse().find(e => parseSource(messageText(e.message))); const source = prompt ? parseSource(messageText(prompt.message)) : undefined; if (!source) throw new Error("No valid crew context source locator found");
-    const path = readdirSync(roleCtx.sessionManager.getSessionDir()).map(name => join(roleCtx.sessionManager.getSessionDir(), name)).find(name => name.includes(source.brainSessionId)); if (!path) throw new Error("Invoking brain session could not be resolved");
-    const native = parseJsonlSession(readFileSync(path, "utf8")); if (native.sessionId !== source.brainSessionId) throw new Error("Brain session header ID mismatch"); const branch = reconstructBranch(native.entries, source.upperBoundEntryId); const checkpoint = source.checkpointEntryId ? branch.findIndex(e => e.id === source.checkpointEntryId) : branch.length; if (checkpoint < 0) throw new Error("Checkpoint is not on the frozen branch");
-    const p = (raw ?? {}) as { mode?: string; query?: string; entryId?: string; maxChars?: number };
-    const latestPrompt = [...roleCtx.sessionManager.getBranch()].reverse().findIndex(e => !!parseSource(messageText(e.message))); const afterPrompt = latestPrompt < 0 ? [] : roleCtx.sessionManager.getBranch().slice(roleCtx.sessionManager.getBranch().length - latestPrompt - 1);
-    const priorReads = afterPrompt.filter(e => e.message?.role === "toolResult" && e.message.toolName === "crew_read_context"); const usedChars = priorReads.reduce((sum, e) => sum + (typeof e.message?.details?.returnedChars === "number" ? e.message.details.returnedChars : 0), 0);
-    if (priorReads.length >= 4 || usedChars >= 24_000) throw new Error(`crew_read_context budget exhausted: ${priorReads.length} calls, ${usedChars} characters used`);
-    const limit = Math.min(p.maxChars ?? 6000, 8000, 24_000 - usedChars); if (!Number.isInteger(limit) || limit < 1) throw new Error("maxChars must be a positive integer"); const prior = branch.slice(0, checkpoint); let selected: SessionEntryLike[];
-    if (p.mode === "search") { if (!p.query?.trim()) throw new Error("search requires a non-blank query"); selected = prior.filter(e => messageText(e.message).toLocaleLowerCase().includes(p.query!.toLocaleLowerCase())).slice(0, 20); } else { if (!p.entryId) throw new Error("entryId is required"); const i = prior.findIndex(e => e.id === p.entryId); if (i < 0) throw new Error("entryId is outside the allowed range"); selected = p.mode === "around" ? prior.slice(Math.max(0, i - 2), i + 3) : [prior[i]]; }
-    const full = serializeSessionEntries(selected); const text = full.slice(0, limit); return { content: [{ type: "text", text }], details: { sourceBrainSessionId: source.brainSessionId, sourceCheckpointEntryId: source.checkpointEntryId ?? null, sourceUpperBoundEntryId: source.upperBoundEntryId, mode: p.mode, matchedEntryIds: selected.map(e => e.id).filter((id): id is string => !!id), returnedChars: text.length, remainingChars: full.length - text.length, remainingCalls: Math.max(0, 3 - priorReads.length), truncated: text.length < full.length, nextCursor: text.length < full.length ? "0" : null } };
+    return executeReadContext((raw ?? {}) as ReadContextParams, roleCtx);
   } });
 
 

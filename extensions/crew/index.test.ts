@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   buildRolePrompt,
   appendMarkerInstruction,
@@ -17,6 +20,14 @@ import {
   selectLaunchCommand,
   scopedRoleName,
   normalizeTask,
+  normalizeCommand,
+  buildHandoff,
+  serializeSessionEntries,
+  selectHandoffEntries,
+  parseJsonlSession,
+  reconstructBranch,
+  findLatestDelegationPrompt,
+  resolveNativeSessionPath,
   parseModelCatalog,
   modelMatch,
   classifyAgentStatus,
@@ -45,6 +56,46 @@ test("blocked and timeout statuses are not completion", () => {
   assert.equal(classifyAgentStatus("blocked"), "blocked");
   assert.equal(classifyAgentStatus("timed_out"), "timed_out");
   assert.equal(classifyAgentStatus("working"), "working");
+});
+
+
+const messageEntry = (id: string, role: string, content: unknown, parentId?: string, extra: Record<string, unknown> = {}) => ({ type: "message", id, parentId: parentId ?? null, message: { role, content, ...extra } });
+
+test("handoff selects the latest complete checkpoint and excludes the current call", () => {
+  const branch = [messageEntry("u1", "user", [{ type: "text", text: "old" }]), messageEntry("r1", "toolResult", "complete", "u1", { toolName: "crew_launch", isError: false, details: { complete: true } }), messageEntry("u2", "user", [{ type: "text", text: "correction" }], "r1"), messageEntry("call", "assistant", [{ type: "toolCall", id: "current", name: "crew_launch" }], "u2")];
+  const result = buildHandoff(branch, "current");
+  assert.match(result.text, /complete/); assert.match(result.text, /correction/); assert.doesNotMatch(result.text, /current/); assert.equal(result.checkpointEntryId, "r1");
+});
+
+test("explicit fallback does not select recent history", () => {
+  const branch = [messageEntry("u1", "user", "OLD"), messageEntry("call", "assistant", [{ type: "toolCall", id: "current", name: "crew_launch" }], "u1")];
+  assert.equal(buildHandoff(branch, "current", "since-last-crew", "explicit", 6, 24000, "EXPLICIT").text, "EXPLICIT");
+});
+
+test("serialization excludes hidden reasoning but retains custom messages and tool relationships", () => {
+  const entries = [messageEntry("a", "assistant", [{ type: "thinking", thinking: "secret" }, { type: "text", text: "visible" }, { type: "toolCall", id: "call-1", name: "bash" }]), { type: "custom_message", id: "c", parentId: "a", customType: "note", content: "custom context" }, messageEntry("t", "toolResult", "evidence", "a", { toolName: "bash", toolCallId: "call-1", isError: false })];
+  const text = serializeSessionEntries(entries); assert.match(text, /visible/); assert.match(text, /custom context/); assert.match(text, /evidence/); assert.doesNotMatch(text, /secret/);
+});
+
+test("native JSONL rejects a terminated malformed final line", () => {
+  assert.throws(() => parseJsonlSession('{"type":"session","id":"s"}\nnot-json\n'), /Malformed|invalid/i);
+});
+
+test("branch reconstruction rejects missing parents and cycles", () => {
+  assert.throws(() => reconstructBranch([{ id: "x", parentId: "missing", type: "message" }], "x"), /parent/i);
+  assert.throws(() => reconstructBranch([{ id: "x", parentId: "y", type: "message" }, { id: "y", parentId: "x", type: "message" }], "x"), /cycle/i);
+});
+
+test("latest explicit or ephemeral delegation supersedes an older locator", () => {
+  const oldPrompt = messageEntry("old", "user", "You are oracle.\n## Working directory\n/repo\n## Required response\nreturn findings\n<crew-context-source>\n{\"version\":1,\"brainSessionId\":\"brain-old\",\"upperBoundEntryId\":\"entry-old\"}\n</crew-context-source>");
+  const latestPrompt = messageEntry("latest", "user", "<crew-delegation version=\"1\">\nYou are oracle.\n## Role\noracle\n## Authority\nread-only\n## Working directory\n/repo\n## Objective\nnew task\n## Context\nEXPLICIT\n## Constraints\nnone\n## Acceptance criteria\ncheck\n## Required response\nreturn findings");
+  assert.equal(findLatestDelegationPrompt([oldPrompt, latestPrompt])?.id, "latest");
+});
+
+test("native session resolution rejects symlinked candidates", () => {
+  const directory = mkdtempSync(join(tmpdir(), "crew-session-")); const outside = mkdtempSync(join(tmpdir(), "crew-outside-"));
+  writeFileSync(join(outside, "real.jsonl"), "{}"); symlinkSync(join(outside, "real.jsonl"), join(directory, "timestamp_brain-safe.jsonl"));
+  assert.throws(() => resolveNativeSessionPath(directory, "brain-safe"), /symlink|regular|containment|escapes/i);
 });
 
 function test(name: string, fn: () => void) {
