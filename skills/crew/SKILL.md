@@ -70,8 +70,8 @@ For ordinary delegation, call `crew_launch` with:
 - `role`: role name, such as `scout`, `oracle`, `executor`, `reviewer`, or a configured custom role
 - `task`: a fully expanded, self-contained objective; automatic handoff provides only bounded prior context, while explicit mode provides caller-supplied context only
 - optional `context`, `constraints`, `acceptanceCriteria`, and `expectedOutput`
-- optional `command`: one native Pi slash command to execute in the target role session, such as `/openspec-propose`; this is not a shell command
-- optional `startupTimeoutMs`, `timeoutMs`, `readLines`, and `command` only when needed
+- Native slash-command execution is not currently exposed; do not describe prose instructions as native command execution.
+- optional `startupTimeoutMs`, `timeoutMs`, and `readLines` tuning fields
 
 Never send unresolved references such as "above", "that", "the plan", or "implement it". Expand paths, decisions, constraints, and desired output in the contract.
 

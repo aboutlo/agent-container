@@ -184,7 +184,7 @@ function messageText(message: SessionMessage | undefined): string {
   if (!message) return "";
   const content = message.content;
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content === undefined ? "" : `[attachment: ${typeof content}]`;
+  if (!Array.isArray(content)) return content === undefined ? "" : "";
   return content.flatMap((item) => {
     if (typeof item === "string") return [item];
     if (!item || typeof item !== "object") return [];
@@ -192,11 +192,12 @@ function messageText(message: SessionMessage | undefined): string {
     if (part.type === "thinking" || part.type === "thinkingSignature") return [];
     if (part.type === "text" && typeof part.text === "string") return [part.text];
     if (part.type === "toolCall") return [`[tool call: ${typeof part.name === "string" ? part.name : "unknown"}${typeof part.id === "string" ? ` id=${part.id}` : ""}]`];
-    return [`[attachment: ${part.type ?? "unsupported content"}]`];
+    if (part.type === "image") { const image = part as { mimeType?: unknown; mediaType?: unknown; width?: unknown; height?: unknown }; const mime = typeof image.mimeType === "string" ? image.mimeType : typeof image.mediaType === "string" ? image.mediaType : "unknown"; const dimensions = typeof image.width === "number" && typeof image.height === "number" ? ` ${image.width}x${image.height}` : ""; return [`[image ${mime}${dimensions}]`]; }
+    return [];
   }).join("\n");
 }
-function eligibleEntry(entry: SessionEntryLike): boolean { return (entry.type === "message" && !!entry.message && ["user", "assistant", "toolResult", "custom"].includes(entry.message.role ?? "")) || entry.type === "custom_message"; }
-function entryText(entry: SessionEntryLike): string { return entry.type === "custom_message" ? (typeof entry.content === "string" ? entry.content : `[custom attachment: ${entry.customType ?? "unknown"}]`) : messageText(entry.message); }
+function eligibleEntry(entry: SessionEntryLike): boolean { if (entry.type === "custom_message") return typeof entry.content === "string" || Array.isArray(entry.content); if (entry.type !== "message" || !entry.message) return false; return ["user", "assistant", "toolResult", "custom"].includes(entry.message.role ?? "") && !!messageText(entry.message).replace(/<crew-context-source>[\s\S]*?<\/crew-context-source>/g, "").trim(); }
+function entryText(entry: SessionEntryLike): string { const text = entry.type === "custom_message" ? (typeof entry.content === "string" ? entry.content : Array.isArray(entry.content) ? messageText({ content: entry.content }) : "") : messageText(entry.message); return text.replace(/<crew-context-source>[\s\S]*?<\/crew-context-source>/g, ""); }
 
 export function selectHandoffEntries(entries: SessionEntryLike[]): SessionEntryLike[] {
   return entries.filter((entry) => {
@@ -870,21 +871,57 @@ async function executeReadContext(p: ReadContextParams, roleCtx: ExtensionContex
   const native = parseJsonlSession(readFileSync(resolveNativeSessionPath(roleCtx.sessionManager.getSessionDir(), source.brainSessionId), "utf8"));
   const branch = reconstructBranch(native.entries, source.upperBoundEntryId); const cutoffId = source.retrievalCutoffEntryId ?? source.checkpointEntryId;
   const cutoff = cutoffId ? branch.findIndex(e => e.id === cutoffId) : branch.length; if (cutoff < 0) throw new Error("Retrieval cutoff is not on the frozen branch");
-  const promptIndex = branch.findIndex(e => e.id === prompt.id); const readable = selectReadableEntries(branch.slice(0, Math.min(cutoff, promptIndex < 0 ? cutoff : promptIndex))); if (source.retrievalCutoffEntryId && !branch.some(e => e.id === source.retrievalCutoffEntryId)) throw new Error("Retrieval cutoff is not on the frozen branch");
-  const after = roleBranch.slice(roleBranch.findIndex(e => e.id === prompt.id) + 1); const reads = after.filter(e => e.message?.role === "toolResult" && e.message.toolName === "crew_read_context");
-  const used = reads.reduce((n, e) => n + (typeof e.message?.details?.returnedChars === "number" ? e.message.details.returnedChars : 0), 0); const priorCount = reads.length;
-  if (priorCount >= 4 || used >= 24_000) throw new Error("crew_read_context budget exhausted");
-  const limit = p.maxChars === undefined ? 6000 : p.maxChars; if (!Number.isInteger(limit) || limit < 1 || limit > 8000) throw new Error("maxChars must be an integer from 1 through 8000");
-  let selected: SessionEntryLike[]; if (p.cursor) { const c = decodeCursor(p.cursor); if (c.source !== source.upperBoundEntryId || c.mode !== p.mode) throw new Error("Invalid cursor"); selected = readable.slice(Number(c.nextIndex)); } else if (p.mode === "search") { if (!p.query?.trim()) throw new Error("search requires a non-blank query"); selected = searchContext(readable, p.query); } else { if (!p.entryId) throw new Error("entryId is required"); selected = p.mode === "around" ? readContextAround(readable, p.entryId) : [readContextEntry(readable, p.entryId)]; }
-  const full = serializeSessionEntries(selected); const text = full.length <= limit ? full : full.slice(0, limit); const budget = calculateReadBudget(priorCount, used, text.length); const nextIndex = (p.cursor ? Number(decodeCursor(p.cursor).nextIndex) : 0) + Math.max(1, selected.length);
-  return { content: [{ type: "text", text }], details: { sourceBrainSessionId: source.brainSessionId, sourceUpperBoundEntryId: source.upperBoundEntryId, mode: p.mode, matchedEntryIds: selected.map(e => e.id).filter(Boolean), returnedChars: text.length, remainingChars: budget.remainingChars, remainingCalls: budget.remainingCalls, nextCursor: nextIndex < readable.length ? encodeCursor({ version: 1, source: source.upperBoundEntryId, mode: p.mode, nextIndex }) : undefined } };
+  const promptIndex = branch.findIndex(e => e.id === prompt.id);
+  const end = Math.min(cutoff, promptIndex < 0 ? cutoff : promptIndex);
+  const readable = selectReadableEntries(branch.slice(0, end));
+  const rolePromptIndex = roleBranch.findIndex(e => e.id === prompt.id);
+  if (rolePromptIndex < 0) throw new Error("Delegation prompt is not on the active role branch");
+  const reads = roleBranch.slice(rolePromptIndex + 1).filter(e => e.message?.role === "toolResult" && e.message.toolName === "crew_read_context");
+  const used = reads.reduce((n, e) => n + (typeof e.message?.details?.returnedChars === "number" ? e.message.details.returnedChars : 0), 0);
+  if (reads.length >= 4 || used >= 24_000) throw new Error("crew_read_context budget exhausted");
+  const requestedLimit = p.maxChars === undefined ? 6000 : p.maxChars; if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 8000) throw new Error("maxChars must be an integer from 1 through 8000"); const limit = Math.min(requestedLimit, 24_000 - used); if (limit < 1) throw new Error("crew_read_context character budget exhausted");
+  if (p.mode !== "search" && p.mode !== "entry" && p.mode !== "around") throw new Error("mode must be search, entry, or around");
+  let selected: SessionEntryLike[];
+  let candidateIndices: number[] = [];
+  let startIndex = 0;
+  let offset = 0;
+  let cursorState: any;
+  if (p.cursor) {
+    cursorState = decodeCursor(p.cursor);
+    if (cursorState.version !== 1 || cursorState.source !== source.upperBoundEntryId || cursorState.mode !== p.mode || !Array.isArray(cursorState.indices) || !cursorState.indices.every((i: unknown) => Number.isInteger(i) && (i as number) >= 0 && (i as number) < readable.length) || !Number.isInteger(cursorState.nextIndex) || cursorState.nextIndex < 0 || cursorState.nextIndex > cursorState.indices.length) throw new Error("Invalid cursor");
+    candidateIndices = cursorState.indices; startIndex = cursorState.nextIndex; offset = Number.isInteger(cursorState.offset) ? cursorState.offset : 0;
+    selected = candidateIndices.slice(startIndex).map(i => readable[i]);
+    // Cursor selection is reconstructed from the validated candidate indices above.
+  } else if (p.mode === "search") {
+    if (!p.query?.trim()) throw new Error("search requires a non-blank query");
+    selected = searchContext(readable, p.query); candidateIndices = selected.map(e => readable.findIndex(x => x.id === e.id));
+  } else {
+    if (!p.entryId) throw new Error("entryId is required");
+    selected = p.mode === "around" ? readContextAround(readable, p.entryId) : [readContextEntry(readable, p.entryId)]; candidateIndices = selected.map(e => readable.findIndex(x => x.id === e.id));
+  }
+  const chunks: string[] = [];
+  let consumed = 0;
+  for (const entry of selected) {
+    const serialized = serializeSessionEntries([entry]);
+    const available = limit - consumed;
+    if (serialized.length <= available) { chunks.push(serialized); consumed += serialized.length; startIndex += 1; offset = 0; continue; }
+    const part = serialized.slice(offset, offset + Math.max(0, available));
+    if (part) chunks.push(part);
+    offset += part.length;
+    break;
+  }
+  const text = chunks.join("\n\n");
+  const hasMore = startIndex < candidateIndices.length && selected.length > 0;
+  const nextCursor = hasMore ? encodeCursor({ version: 1, source: source.upperBoundEntryId, mode: p.mode, indices: candidateIndices, nextIndex: startIndex, offset }) : undefined;
+  const budget = calculateReadBudget(reads.length, used, text.length);
+  return { content: [{ type: "text", text }], details: { sourceBrainSessionId: source.brainSessionId, sourceCheckpointEntryId: source.checkpointEntryId ?? null, sourceUpperBoundEntryId: source.upperBoundEntryId, mode: p.mode, matchedEntryIds: selected.map(e => e.id).filter(Boolean), returnedChars: text.length, remainingChars: budget.remainingChars, remainingCalls: budget.remainingCalls, truncated: !!nextCursor, nextCursor } };
 }
 
-export default function crewExtension(pi: ExtensionAPI) {
+export function crewExtension(pi: ExtensionAPI) {
   const parameters = { type: "object", required: ["role", "task"], properties: {
     role: { type: "string", description: "Crew role name, such as scout, oracle, executor, or reviewer." },
 
-    task: { type: "string", description: "Self-contained delegation objective. The role cannot see the parent conversation. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid a task made only of unresolved references such as 'implement it'." },
+    task: { type: "string", description: "Self-contained delegation objective. Automatic mode supplies a bounded handoff; explicit mode uses caller context only. Put concrete supporting information in context, constraints, acceptanceCriteria, and expectedOutput; avoid unresolved references such as 'implement it'." },
     context: { type: "string", description: "Relevant prior decisions, files, findings, or requirements." }, constraints: { type: "string", description: "Boundaries and invariants." },
     acceptanceCriteria: { type: "string", description: "How the result should be judged." }, expectedOutput: { type: "string", description: "Required response format." },
     startupTimeoutMs: { type: "number", description: "Maximum startup detection wait. Defaults to 120000." }, timeoutMs: { type: "number", description: "Maximum inactivity wait after prompt submission. Progress and a working agent refresh this timeout. Defaults to 120000." }, readLines: { type: "number", description: "Recent output lines. Defaults to 200." }, contextMode: { type: "string", enum: ["explicit", "since-last-crew"] }, checkpointFallback: { type: "string", enum: ["recent", "explicit", "error"] }, recentTurns: { type: "number" }, maxHandoffChars: { type: "number" }, configCwd: { type: "string", description: "Explicit config lookup override." },
@@ -895,7 +932,7 @@ export default function crewExtension(pi: ExtensionAPI) {
     const key = authority === "read-only" ? `readonly:${normalizedCwd(params.configCwd ?? process.cwd())}:${Date.now()}:${Math.random()}` : `writer:${params.configCwd ? normalizedCwd(params.configCwd) : "pane"}`;
     return enqueueCrewLaunch(key, () => executeCrewLaunch(pi, params, signal, onUpdate, ctx));
   };
-  pi.registerTool({ name: "crew_launch", label: "Crew Launch", executionMode: "sequential", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Fully expand context; the role cannot see the parent conversation."], parameters, execute });
+  pi.registerTool({ name: "crew_launch", label: "Crew Launch", executionMode: "sequential", description: "Run or reuse a visible Herdr role pane and return structured status.", promptSnippet: "Delegate a self-contained task to a visible crew role pane.", promptGuidelines: ["Use crew_launch for delegation.", "Use explicit context when automatic handoff is disabled; keep delegation objectives concrete."], parameters, execute });
   pi.registerTool({ name: "crew_read_context", label: "Crew Read Context", description: "Read a bounded older passage from the invoking brain session.", parameters: readContextParameters(), async execute(_id, raw, _signal, _update, roleCtx) {
     if (!roleCtx) throw new Error("crew_read_context is unavailable without native session context");
     return executeReadContext((raw ?? {}) as ReadContextParams, roleCtx);
@@ -919,3 +956,5 @@ export default function crewExtension(pi: ExtensionAPI) {
     },
   });
 }
+
+export default crewExtension;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -33,6 +33,11 @@ import {
   classifyAgentStatus,
   functionalPreflight,
   isStartupBlockedOutput,
+  assertValidSessionId,
+  encodeCursor,
+  decodeCursor,
+  calculateReadBudget,
+  crewExtension,
 } from "./index.ts";
 
 test("unresolved delegation references are rejected conservatively", () => {
@@ -94,8 +99,9 @@ test("latest explicit or ephemeral delegation supersedes an older locator", () =
 
 test("native session resolution rejects symlinked candidates", () => {
   const directory = mkdtempSync(join(tmpdir(), "crew-session-")); const outside = mkdtempSync(join(tmpdir(), "crew-outside-"));
-  writeFileSync(join(outside, "real.jsonl"), "{}"); symlinkSync(join(outside, "real.jsonl"), join(directory, "timestamp_brain-safe.jsonl"));
-  assert.throws(() => resolveNativeSessionPath(directory, "brain-safe"), /symlink|regular|containment|escapes/i);
+  try { writeFileSync(join(outside, "real.jsonl"), "{}"); symlinkSync(join(outside, "real.jsonl"), join(directory, "timestamp_brain-safe.jsonl"));
+    assert.throws(() => resolveNativeSessionPath(directory, "brain-safe"), /symlink|regular|containment|escapes/i);
+  } finally { rmSync(directory, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
 });
 
 function test(name: string, fn: () => void) {
@@ -332,4 +338,50 @@ void regressionTest("functional preflight uses direct Herdr despite login-shell 
   assert.deepEqual(calls, [["herdr", "pane", "current", "--current"]]);
   if (oldEnv === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = oldEnv;
   if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+});
+
+
+test("handoff selection exposes effective fallback and retrieval cutoff", () => {
+  const branch = [messageEntry("u", "user", "context"), messageEntry("call", "assistant", [{ type: "toolCall", id: "c", name: "crew_launch" }], "u")];
+  const recent = buildHandoff(branch, "c", "since-last-crew", "recent");
+  assert.equal(recent.fallbackUsed, "recent"); assert.equal(recent.retrievalCutoffEntryId, "u"); assert.equal(recent.automaticText, recent.text);
+  const explicit = buildHandoff(branch, "c", "since-last-crew", "explicit", 6, 24000, "caller");
+  assert.equal(explicit.fallbackUsed, "explicit"); assert.equal(explicit.automaticText, undefined);
+});
+
+test("session IDs accept periods and reject unsafe forms", () => {
+  assert.doesNotThrow(() => assertValidSessionId("brain.01"));
+  assert.throws(() => assertValidSessionId("../escape"), /Invalid session ID/);
+  assert.throws(() => assertValidSessionId("-bad"), /Invalid session ID/);
+});
+
+test("incomplete non-newline JSONL append is ignored", () => {
+  const raw = '{"type":"session","id":"brain.01"}\n{"id":"ok","parentId":null}\n' + "{";
+  assert.equal(parseJsonlSession(raw).entries.length, 1);
+});
+
+test("cursor encoding is opaque, validates malformed values, and budget is exact", () => {
+  const cursor = encodeCursor({ mode: "search", nextIndex: 2 }); assert.notEqual(cursor, JSON.stringify({ mode: "search", nextIndex: 2 }));
+  assert.deepEqual(decodeCursor(cursor), { mode: "search", nextIndex: 2 }); assert.throws(() => decodeCursor("bad"), /Invalid cursor/);
+  assert.deepEqual(calculateReadBudget(1, 100, 50), { remainingChars: 23850, remainingCalls: 2 });
+});
+
+test("registered crew launch is sequential", () => {
+  const tools: any[] = [];
+  crewExtension({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), registerTool: (tool: any) => tools.push(tool) });
+  assert.equal(tools.find(t => t.name === "crew_launch")?.executionMode, "sequential");
+  assert.ok(tools.find(t => t.name === "crew_read_context")?.parameters.properties.cursor);
+});
+
+test("role command quotes unsafe session directories", () => {
+  assert.equal(buildRoleCommand("pi", "provider/model", "/tmp/a b;rm -rf x"), "pi --approve --model provider/model --session-dir '/tmp/a b;rm -rf x'");
+});
+
+
+test("registered read rejects latest locator-less delegation instead of using stale locator", async () => {
+  const tools: any[] = []; crewExtension({ exec: async () => ({ code: 0, stdout: "", stderr: "" }), registerTool: (tool: any) => tools.push(tool) });
+  const readTool = tools.find(t => t.name === "crew_read_context");
+  const old = messageEntry("old", "user", '<crew-delegation version="1">\nYou are scout.\n## Role\nscout\n## Authority\nread-only\n## Working directory\n/repo\n## Objective\nold\n## Context\nold\n## Constraints\nnone\n## Acceptance criteria\ncheck\n## Required response\nreturn\n<crew-context-source>\n{"version":1,"brainSessionId":"brain.01","upperBoundEntryId":"u"}\n</crew-context-source>');
+  const latest = messageEntry("latest", "user", buildRolePrompt("scout", { name: "scout", authority: "read-only" }, "new", "/repo", { contextMode: "explicit" }));
+  await assert.rejects(readTool.execute("r", { mode: "search", query: "x" }, undefined, undefined, { cwd: "/repo", sessionManager: { getBranch: () => [old, latest], getSessionDir: () => "/nope", getSessionFile: () => undefined, getLeafId: () => "latest", getSessionId: () => "role.01" } }), /locator/i);
 });
