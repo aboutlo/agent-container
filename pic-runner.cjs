@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
+const { stagePackageResources } = require('./pi-package-resources.cjs');
 const {
   parseContainerRunnerArgs,
   proxyEnvironmentArgs: buildProxyEnvironmentArgs,
@@ -158,13 +159,12 @@ function log(message) {
 }
 
 function stageHostSkills() {
-  const sourceDir = path.join(home, '.pi', 'agent', 'skills');
+  const agentDir = path.join(home, '.pi', 'agent');
+  const sourceDir = path.join(agentDir, 'skills');
   fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
   fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
 
-  if (!fs.existsSync(sourceDir)) return;
-
-  for (const name of fs.readdirSync(sourceDir)) {
+  for (const name of fs.existsSync(sourceDir) ? fs.readdirSync(sourceDir) : []) {
     const source = path.join(sourceDir, name);
     const skillFile = path.join(source, 'SKILL.md');
     if (!fs.existsSync(skillFile)) {
@@ -183,14 +183,16 @@ function stageHostSkills() {
       log(`warning: failed to stage host skill "${name}": ${error.message}`);
     }
   }
+
+  stagePackageResources(agentDir, stagedHostSkillsDir, 'skills', log);
 }
 
 function stageHostExtensions() {
-  const sourceDir = path.join(home, '.pi', 'agent', 'extensions');
+  const agentDir = path.join(home, '.pi', 'agent');
+  const sourceDir = path.join(agentDir, 'extensions');
   fs.rmSync(stagedHostExtensionsDir, { recursive: true, force: true });
   fs.mkdirSync(stagedHostExtensionsDir, { recursive: true });
-  if (!fs.existsSync(sourceDir)) return;
-  for (const name of fs.readdirSync(sourceDir)) {
+  for (const name of fs.existsSync(sourceDir) ? fs.readdirSync(sourceDir) : []) {
     const source = path.join(sourceDir, name);
     try {
       fs.cpSync(source, path.join(stagedHostExtensionsDir, name), { recursive: true, dereference: true, force: true });
@@ -198,6 +200,7 @@ function stageHostExtensions() {
       log(`warning: failed to stage host extension "${name}": ${error.message}`);
     }
   }
+  stagePackageResources(agentDir, stagedHostExtensionsDir, 'extensions', log);
 }
 
 function maybeRenameHerdrAgent() {
@@ -325,15 +328,16 @@ function listContainersJson() {
 }
 
 function refreshContainerExtensions(containerId) {
-  const stagedCrew = path.join(stagedHostExtensionsDir, 'crew', 'index.ts');
-  if (!fs.existsSync(stagedCrew)) return true;
-  const command = `mkdir -p /root/.pi/agent/extensions && rm -rf /root/.pi/agent/extensions/crew && cp -aL ${workspaceTarget}/.pi/host-agent-extensions/crew /root/.pi/agent/extensions/crew && test -f /root/.pi/agent/extensions/crew/index.ts`;
+  const staged = fs.existsSync(stagedHostExtensionsDir) ? fs.readdirSync(stagedHostExtensionsDir) : [];
+  if (staged.length === 0) return true;
+  const source = `${workspaceTarget}/.pi/host-agent-extensions`;
+  const command = `mkdir -p /root/.pi/agent/extensions && cp -aL ${source}/. /root/.pi/agent/extensions/`;
   const result = spawnSync('container', ['exec', containerId, 'sh', '-lc', command], { stdio: verbose ? 'inherit' : 'pipe', encoding: 'utf8' });
   if (result.status !== 0) {
-    log(`container "${containerId}" has no usable staged Crew extension; it will not be reused`);
+    log(`container "${containerId}" failed to refresh staged extensions; it will not be reused`);
     return false;
   }
-  log(`verified Crew extension in reused container "${containerId}"`);
+  log(`refreshed ${staged.length} staged extension(s) in reused container "${containerId}"`);
   return true;
 }
 // Check if a running container already has workdir mounted as a virtiofs share

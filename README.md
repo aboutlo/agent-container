@@ -116,13 +116,15 @@ pic-proxy attach # shell in the matching project container, or start one
 clc-proxy        # Claude Code through the host-side proxy
 ```
 
-### Crew skill
+### Package resources
 
-The project includes [`skills/crew/SKILL.md`](skills/crew/SKILL.md), which lets Pi delegate focused work to visible Herdr role panes such as `scout`, `oracle`, `executor`, and `reviewer`. It works with both `pic` and `pic-proxy`; use it when you want parallel research, planning, implementation, or review from the current Pi session. Install the local crew extension with:
+The runners stage the resources of enabled Pi packages into the container. A package declares
+them in `package.json` under `pi.extensions` and `pi.skills`.
 
-```bash
-npm run install-crew
-```
+Sources installed under `~/.pi/agent` (`npm:` and git) already reach the container through the
+read-only `~/.pi` mount, so the runners copy only packages that live outside that directory.
+Staged names are qualified as `<package>--<resource>`, because two packages can expose the same
+file name. Tests and `node_modules` are never staged.
 
 ### Herdr integration
 
