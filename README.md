@@ -126,6 +126,10 @@ read-only `~/.pi` mount, so the runners copy only packages that live outside tha
 Staged names are qualified as `<package>--<resource>`, because two packages can expose the same
 file name. Tests and `node_modules` are never staged.
 
+Skills also come from the two host skill directories the container cannot see: `~/.pi/agent/skills`
+then `~/.agents/skills`. On a name clash the earlier source wins, in the order: project directory,
+`~/.pi/agent/skills`, `~/.agents/skills`, packages.
+
 ### Herdr integration
 
 When `pic` or `pic-proxy` is launched inside a Herdr pane, the runner auto-enables Pi status reporting through a host/container socket bridge. No Herdr socket is bind-mounted into the Apple container.

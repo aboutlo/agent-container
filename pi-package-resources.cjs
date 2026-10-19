@@ -89,7 +89,9 @@ function stageContent(source, root) {
 
 function stagePackageResources(agentDir, destDir, kind, log) {
   fs.mkdirSync(destDir, { recursive: true });
+  const taken = new Set(fs.readdirSync(destDir));
   for (const resource of packageResources(agentDir)[kind]) {
+    if (taken.has(resource.name)) continue;
     const target = path.join(destDir, resource.name);
     try {
       fs.cpSync(resource.path, target, {

@@ -158,18 +158,19 @@ function log(message) {
   console.log(`[${commandName}] ${message}`);
 }
 
-function stageHostSkills() {
-  const agentDir = path.join(home, '.pi', 'agent');
-  const sourceDir = path.join(agentDir, 'skills');
-  fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
-  fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
+// Pi keeps the first skill it sees on a name clash, so later sources skip taken names.
+function stagedSkillNames() {
+  return new Set(fs.readdirSync(stagedHostSkillsDir));
+}
 
-  for (const name of fs.existsSync(sourceDir) ? fs.readdirSync(sourceDir) : []) {
+function stageSkillsFrom(sourceDir) {
+  if (!fs.existsSync(sourceDir)) return;
+  const taken = stagedSkillNames();
+  for (const name of fs.readdirSync(sourceDir)) {
+    if (taken.has(name)) continue;
     const source = path.join(sourceDir, name);
-    const skillFile = path.join(source, 'SKILL.md');
-    if (!fs.existsSync(skillFile)) {
-      const stat = fs.lstatSync(source);
-      if (stat.isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
+    if (!fs.existsSync(path.join(source, 'SKILL.md'))) {
+      if (fs.lstatSync(source).isSymbolicLink()) log(`warning: skipping host skill "${name}" because its symlink target is unavailable`);
       continue;
     }
 
@@ -183,7 +184,15 @@ function stageHostSkills() {
       log(`warning: failed to stage host skill "${name}": ${error.message}`);
     }
   }
+}
 
+function stageHostSkills() {
+  const agentDir = path.join(home, '.pi', 'agent');
+  fs.rmSync(stagedHostSkillsDir, { recursive: true, force: true });
+  fs.mkdirSync(stagedHostSkillsDir, { recursive: true });
+  stageSkillsFrom(path.join(agentDir, 'skills'));
+  // Skills-manager installs land in ~/.agents/skills, which the container cannot see.
+  stageSkillsFrom(path.join(home, '.agents', 'skills'));
   stagePackageResources(agentDir, stagedHostSkillsDir, 'skills', log);
 }
 

@@ -81,7 +81,8 @@ case "${1:-}" in
     #   ./skills/<name>                 (versioned project skills, preferred here)
     #   ./.pi/skills/<name>             (Pi project-local convention)
     #   ./.pi/agent/skills/<name>       (legacy compatibility)
-    #   ./.pi/host-agent-skills/<name>  (host ~/.pi/agent/skills staged by pic-runner)
+    #   ./.pi/host-agent-skills/<name>  (host ~/.pi/agent/skills and ~/.agents/skills
+    #                                   staged by pic-runner)
     # Pi loads runtime skills from ~/.pi/agent/skills. Materialize skills there
     # at container startup. Precedence is: ./skills > ./.pi/skills >
     # ./.pi/agent/skills > staged host skills.
