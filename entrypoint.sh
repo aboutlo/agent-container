@@ -74,15 +74,8 @@ case "${1:-}" in
         cp -aL "$extension" "$target"
       done
     fi
-    if [ -d /root/.pi/agent/extensions/crew ] && [ ! -f /root/.pi/agent/extensions/crew/index.ts ]; then
-      echo "[pi-container] fatal: crew extension is not a readable regular file" >&2
-      exit 1
-    fi
     extension_names=$(find /root/.pi/agent/extensions -maxdepth 2 -type f -print 2>/dev/null | sort | tr '\n' ' ')
     echo "[pi-container] staged extensions: ${extension_names:-none}" >&2
-    if [ -f /root/.pi/agent/extensions/crew/index.ts ]; then
-      echo "[pi-container] Crew diagnostic: crew_launch registration source is present" >&2
-    fi
 
     # Pi skills may live in:
     #   ./skills/<name>                 (versioned project skills, preferred here)
