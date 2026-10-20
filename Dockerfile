@@ -7,12 +7,19 @@ ARG RGA_VERSION=0.10.10
 ARG TYPST_VERSION=0.15.0
 
 RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -d -m 0755 /usr/share/keyrings \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /usr/share/keyrings/cloud.google.gpg \
+    && chmod 0644 /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         fd-find \
         ffmpeg \
         git \
+        google-cloud-cli \
         fonts-noto-core \
         jq \
         less \
@@ -51,16 +58,6 @@ RUN apt-get update \
 
 RUN npm install -g @earendil-works/pi-coding-agent pnpm@11.5.2 \
     && npm cache clean --force
-
-RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh -o /tmp/rtk-install.sh \
-    && sh /tmp/rtk-install.sh \
-    && rm /tmp/rtk-install.sh \
-    && ln -sf /root/.local/bin/rtk /usr/local/bin/rtk \
-    && rtk --version \
-    && rtk init -g --agent pi --auto-patch \
-    && mkdir -p /usr/local/share/pi/extensions \
-    && cp /root/.pi/agent/extensions/rtk.ts /usr/local/share/pi/extensions/rtk.ts \
-    && rm -rf /root/.pi
 
 # Install Claude Code (native binary, lands at ~/.local/bin/claude, already on PATH)
 RUN curl -fsSL https://claude.ai/install.sh | bash \

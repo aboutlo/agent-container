@@ -246,7 +246,6 @@ npm --version
 pnpm --version
 fd --version
 rg --version
-rtk --version
 pi --help
 claude --version
 ```
@@ -274,8 +273,6 @@ The custom `node:24-trixie-slim` image includes:
 - `pnpm`
 - `fd`
 - `ripgrep`
-- `rtk` installed under `/root/.local/bin`
-- RTK Pi integration loaded from the mounted Pi config, or from the image fallback
 - **Claude Code** installed via the Anthropic native installer (`~/.local/bin/claude`)
 
 ## Upgrade

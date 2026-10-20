@@ -186,15 +186,6 @@ EOF
       sleep 0.2
     fi
 
-    if [ ! -f /root/.pi/agent/extensions/rtk.ts ] && [ -f /usr/local/share/pi/extensions/rtk.ts ]; then
-      ln -s /usr/local/share/pi/extensions/rtk.ts /root/.pi/agent/extensions/rtk.ts
-    fi
-
-    for extension in /root/.pi/agent/extensions/rtk.ts; do
-      [ -f "$extension" ] || continue
-      set -- -e "$extension" "$@"
-    done
-
     if [ "${HERDR_ENV:-}" = "1" ]; then
       for extension in /root/.pi/agent/extensions/herdr-agent-state.ts; do
         [ -f "$extension" ] || continue
