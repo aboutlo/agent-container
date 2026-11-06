@@ -7,8 +7,10 @@
     "pic": "node ./pic-runner.cjs",
     "proxy": "node ./pic-proxy-runner.cjs",
     "test": "node --test",
-    "clc-proxy": "node ./clc-proxy-runner.cjs"  },
+    "clc-proxy": "node ./clc-proxy-runner.cjs"
+  },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "proxy-chain": "^2.6.0"
   },
   "bin": {

@@ -56,6 +56,28 @@ case "${1:-}" in
     fi
 
     mkdir -p /root/.pi/agent
+    # Configure this Pi process only. A reused container must not keep a prior run's bridge.
+    node <<'NODE'
+const fs = require('node:fs');
+const file = '/root/.pi/agent/mcp.json';
+const config = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+config.mcpServers ||= {};
+delete config.mcpServers.pic_chrome;
+if (process.env.PIC_CHROME_BRIDGE_TOKEN) {
+  // The host's normal Chrome MCP uses a persistent profile. Never start it in this mode.
+  if (config.mcpServers.chrome) config.mcpServers.chrome.enabled = false;
+  config.mcpServers.pic_chrome = {
+    command: 'node', args: ['/usr/local/bin/pic-chrome-mcp'],
+    description: 'Temporary host Chrome profile for this Pi run; manual login is possible.',
+    exposure: 'codemode',
+    toolExposure: {
+      list_pages: 'direct', new_page: 'direct', navigate_page: 'direct',
+      take_screenshot: 'direct', take_snapshot: 'direct', wait_for: 'direct',
+    },
+  };
+}
+fs.writeFileSync(file, JSON.stringify(config));
+NODE
     if [ -d /host-pi/agent/npm ]; then
       ln -s /host-pi/agent/npm /root/.pi/agent/npm
     fi

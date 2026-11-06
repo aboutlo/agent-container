@@ -12,8 +12,7 @@ const {
 } = require('./runner-utils.cjs');
 
 const host = process.env.CLC_PROXY_HOST || '192.168.64.1';
-const port = Number(process.env.CLC_PROXY_PORT || 8888);
-const proxyUrl = `http://${host}:${port}`;
+const port = Number(process.env.CLC_PROXY_PORT ?? 0);
 const verbose = process.env.CLC_PROXY_VERBOSE === '1';
 const workdir = process.env.CLC_WORKDIR || process.cwd();
 const home = process.env.HOME;
@@ -43,7 +42,7 @@ function log(message) {
 }
 
 async function startProxy() {
-  return startProxyWithFallback({ host, port, proxyUrl, verbose, log, logPrefix: 'clc-proxy' });
+  return startProxyWithFallback({ host, port, verbose, log, logPrefix: 'clc-proxy' });
 }
 
 function listContainersJson() {
@@ -209,7 +208,7 @@ async function main() {
       'exec',
       ...(process.stdin.isTTY && process.stdout.isTTY ? ['-it'] : []),
       '-w', workspaceTarget,
-      ...proxyEnvironmentArgs(proxyUrl),
+      ...proxyEnvironmentArgs(proxy.url),
       '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
       '-e', 'IS_SANDBOX=1',
       existingContainerId,
@@ -231,7 +230,7 @@ async function main() {
       '--mount', `type=bind,source=${claudeConfigHostDir},target=${claudeConfigDir}`,
       '--mount', `type=bind,source=${claudeProjectsHostDir},target=${claudeProjectsDir}`,
       '--dns', '1.1.1.1',
-      ...proxyEnvironmentArgs(proxyUrl),
+      ...proxyEnvironmentArgs(proxy.url),
       '-e', `CLAUDE_CONFIG_DIR=${claudeConfigDir}`,
       '-e', 'IS_SANDBOX=1',
       '-w', workspaceTarget,

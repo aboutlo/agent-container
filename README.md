@@ -86,8 +86,7 @@ proxy; the older `pic-proxy` command remains an equivalent compatibility alias.
 
 Direct mode explicitly clears uppercase and lowercase HTTP, HTTPS, and ALL proxy
 variables, including when it reuses a container originally started in proxy mode.
-Containers started by the runner use `--rm`, and a proxy owned by the runner is
-closed when the Pi process exits.
+Containers started by the runner use `--rm`. Each `pic-proxy` or `clc-proxy` run owns a proxy on a new bridge port; it closes with that run. Proxies block HTTP and CONNECT requests to host loopback addresses. They never reuse an unknown proxy or fall back to binding all host interfaces. `PIC_PROXY_PORT` and `CLC_PROXY_PORT` can request an explicit port, but an occupied port fails closed.
 
 Do not bind-mount macOS `~/.claude.json` into the container. Claude Code stores
 macOS credentials in Keychain, while Linux stores credentials under
@@ -112,9 +111,24 @@ From any project directory:
 pic              # Pi with direct networking
 pic --proxy      # Pi through the host-side proxy
 pic-proxy        # compatibility alias for `pic --proxy`
+pic-proxy --chrome-mcp              # temporary profile, deleted after this Pi run
+pic-proxy --chrome-mcp clanker      # connect to persistent Chrome Agent on host port 9222
+pic-proxy --chrome-mcp mail         # other named profile, reused on later runs
 pic-proxy attach # shell in the matching project container, or start one
 clc-proxy        # Claude Code through the host-side proxy
 ```
+
+### Chrome access
+
+`pic --chrome-mcp` and `pic-proxy --chrome-mcp` use a **new temporary Chrome profile** for each Pi run. First, the runner opens **normal Chrome** without MCP so you can log in. Close that window when finished (leave your other Chrome windows open). The runner then starts a second Chrome window under MCP with the **same temporary profile** and starts Pi. The first window must close before MCP can use its profile. When Pi exits, the runner closes MCP Chrome, stops its bridge, and deletes the profile. The flag does not work with `attach`. If you do not need to log in, just close the first window. Google may still reject the session after MCP starts; this is not guaranteed to bypass its browser checks.
+
+`pic-proxy --chrome-mcp clanker` is a special host-attach mode. It starts the Chrome Agent at `~/.local/share/chrome-agent` on `127.0.0.1:9222` if needed, or reuses its open window. Chrome stays open when Pi exits. The **host broker** connects to its DevTools port; the container sees only the broker's filtered MCP tools. This is not Chrome's menu profile named clanker, and it does not use `~/.pic-chrome-profiles/clanker`. If port 9222 belongs to another process, the runner fails instead of connecting to the wrong browser. Chrome Agent mode also refuses to start while an older shared proxy is listening on port 8888; stop those older `pic-proxy`/`clc-proxy` sessions first. Existing processes cannot receive the new proxy rules without a restart. The profile avatar can say Chrome Agent; Chrome flags cannot change the macOS Dock icon.
+
+To reuse a separate browser profile, run `pic-proxy --chrome-mcp mail` (or `pic --chrome-mcp mail`). The profile is stored at `~/.pic-chrome-profiles/mail`, outside the project, and is **not deleted** when Pi exits. You can use the same name on another run; `--chrome-mcp=mail` and the older `--chrome-mcp-profile mail` also work. The name refers to this runner's directory, not a Chrome profile made through Chrome's profile menu. A single bare word after `--chrome-mcp` is a profile name; for a one-word Pi prompt, use `pic-proxy --chrome-mcp -- hello`. As with temporary mode, normal Chrome opens first so you can log in or check the session; close that window to start MCP. The runner refuses a second concurrent run with the same profile name. If a run crashes, close any Chrome window using that profile before removing its stale `~/.pic-chrome-profiles/mail.lock` file. Use only simple names (letters, digits, `.`, `_`, `-`), starting with a letter or digit. A saved profile does not guarantee that Google will accept an MCP-controlled browser.
+
+The host must have Google Chrome and `chrome-devtools-mcp` installed on PATH. The bridge exposes selected browser MCP tools to Pi as `pic_chrome`: page navigation, snapshots, screenshots, and page input. It does not expose raw CDP, arbitrary JavaScript, network inspection, or host file-writing tools. The bridge binds to the Apple container host address (`PIC_PROXY_HOST`, default `192.168.64.1`) and accepts a new token for this run only. It fails rather than binding to all host interfaces if that address is unavailable. Each Pi run gets a separate browser, even if the runner reuses a container.
+
+**Security:** browser actions can read and change data on sites where you log in. Temporary mode removes local cookies after the run; named mode and Chrome Agent retain cookies and sign-in state between runs. Chrome Agent's raw debugging port is unauthenticated on the host loopback, so other local processes could control that browser. Do not publish port 9222. Neither can reverse actions on websites. Do not treat the project container as a strict sandbox: it already mounts the project read-write and copies Pi authentication state. The browser bridge grants the container a further, opt-in capability.
 
 ### Package resources
 

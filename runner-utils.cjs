@@ -1,5 +1,6 @@
 const { spawn } = require('node:child_process');
 const ProxyChain = require('proxy-chain');
+const { proxyRequestPolicy } = require('./proxy-access-policy.cjs');
 
 const proxyEnvironmentNames = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'];
 
@@ -12,16 +13,32 @@ const nodeProxyPreloadSource = [
 ].join('');
 const nodeProxyPreloadImport = `--import=data:text/javascript,${encodeURIComponent(nodeProxyPreloadSource)}`;
 
-function parseContainerRunnerArgs(cliArgs, { booleanFlags = [] } = {}) {
-  const flags = Object.fromEntries(booleanFlags.map(flag => [flag, false]));
+function parseContainerRunnerArgs(cliArgs, { booleanFlags = [], valueFlags = [], optionalValueFlags = [] } = {}) {
+  const flags = Object.fromEntries([...booleanFlags, ...optionalValueFlags].map(flag => [flag, false]));
   const extraVolumes = [];
   const extraPublish = [];
   const passthroughArgs = [];
 
   for (let i = 0; i < cliArgs.length; i += 1) {
     const arg = cliArgs[i];
-    if (booleanFlags.includes(arg)) {
+    if (optionalValueFlags.includes(arg)) {
+      // One bare word is a profile name. Use `--` before a one-word Pi prompt.
+      const next = cliArgs[i + 1];
+      flags[arg] = next && next !== 'attach' && !next.startsWith('-') && !/\s/.test(next)
+        ? cliArgs[++i] : true;
+    } else if (optionalValueFlags.some(flag => arg.startsWith(`${flag}=`))) {
+      const flag = optionalValueFlags.find(name => arg.startsWith(`${name}=`));
+      flags[flag] = arg.slice(flag.length + 1);
+      if (!flags[flag]) throw new Error(`${flag} requires a value after =`);
+    } else if (booleanFlags.includes(arg)) {
       flags[arg] = true;
+    } else if (valueFlags.includes(arg)) {
+      if (!cliArgs[i + 1] || cliArgs[i + 1].startsWith('-')) throw new Error(`${arg} requires a value`);
+      flags[arg] = cliArgs[++i];
+    } else if (valueFlags.some(flag => arg.startsWith(`${flag}=`))) {
+      const flag = valueFlags.find(name => arg.startsWith(`${name}=`));
+      flags[flag] = arg.slice(flag.length + 1);
+      if (!flags[flag]) throw new Error(`${flag} requires a value`);
     } else if ((arg === '--volume' || arg === '-v') && i + 1 < cliArgs.length) {
       extraVolumes.push(cliArgs[i + 1]);
       i += 1;
@@ -54,36 +71,23 @@ function proxyEnvironmentArgs(proxyUrl, { enabled = true } = {}) {
   return args;
 }
 
-async function startProxy({ host, port, proxyUrl = `http://${host}:${port}`, verbose = false, log, logPrefix = 'proxy' }) {
+async function startProxy({ host, port = 0, verbose = false, log, logPrefix = 'proxy' }) {
   const attachRequestFailedLogger = (server) => {
     server.on('requestFailed', ({ request, error }) => {
       console.error(`[${logPrefix}] request failed ${request?.url || ''}: ${error?.message || error}`);
     });
   };
 
-  const server = new ProxyChain.Server({ host, port, verbose });
+  const server = new ProxyChain.Server({ host, port, verbose, prepareRequestFunction: proxyRequestPolicy });
   attachRequestFailedLogger(server);
-
   try {
     await server.listen();
-    log(`proxy-chain listening on ${proxyUrl}`);
-    return { server, started: true };
   } catch (error) {
-    if (error && error.code === 'EADDRINUSE') {
-      log(`reusing existing proxy on ${proxyUrl}`);
-      return { server: null, started: false };
-    }
-    if (error && error.code === 'EADDRNOTAVAIL') {
-      log(`address ${host} not available, falling back to 0.0.0.0`);
-      const fallbackHost = '0.0.0.0';
-      const fallbackServer = new ProxyChain.Server({ host: fallbackHost, port, verbose });
-      attachRequestFailedLogger(fallbackServer);
-      await fallbackServer.listen();
-      log(`proxy-chain listening on 0.0.0.0:${port} (configured proxy URL: ${proxyUrl})`);
-      return { server: fallbackServer, started: true };
-    }
-    throw error;
+    throw new Error(`Refusing to reuse an unknown proxy on ${host}:${port}: ${error.message}`);
   }
+  const url = `http://${host}:${server.port}`;
+  log(`protected proxy-chain listening on ${url}`);
+  return { server, started: true, url };
 }
 
 function runChildProcess(command, args, { cleanup } = {}) {
@@ -95,6 +99,11 @@ function runChildProcess(command, args, { cleanup } = {}) {
   process.once('SIGINT', () => forwardSignal('SIGINT'));
   process.once('SIGTERM', () => forwardSignal('SIGTERM'));
 
+  child.on('error', async (error) => {
+    console.error(`[runner] failed to start ${command}: ${error.message}`);
+    if (cleanup) await cleanup();
+    process.exit(1);
+  });
   child.on('exit', async (code, signal) => {
     if (cleanup) await cleanup();
     if (signal) process.kill(process.pid, signal);

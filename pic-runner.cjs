@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { listContainersJson: listContainersJsonWithRecovery } = require('./container-system.cjs');
 const { stagePackageResources } = require('./pi-package-resources.cjs');
+const { startChromeBridge } = require('./chrome-bridge.cjs');
 const {
   parseContainerRunnerArgs,
   proxyEnvironmentArgs: buildProxyEnvironmentArgs,
@@ -23,8 +24,7 @@ function readTextIfExists(file) {
 }
 
 const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
-const port = Number(process.env.PIC_PROXY_PORT || 8888);
-const proxyUrl = `http://${host}:${port}`;
+const port = Number(process.env.PIC_PROXY_PORT ?? 0);
 const verbose = process.env.PIC_PROXY_VERBOSE === '1';
 const workdir = process.env.PIC_WORKDIR || process.cwd();
 const home = process.env.HOME;
@@ -35,11 +35,18 @@ if (process.env.HERDR_ENV === '1' && !process.env.HERDR_AGENT) {
   process.env.HERDR_AGENT = 'pi';
 }
 
-// Extract runner-level --proxy, --anthropic/-a, --volume, and --publish/-p
-// arguments; pass the rest to Pi.
-const parsedArgs = parseContainerRunnerArgs(cliArgs, { booleanFlags: ['--proxy', '--anthropic', '-a'] });
+// Extract runner flags and pass the rest to Pi.
+const parsedArgs = parseContainerRunnerArgs(cliArgs, {
+  booleanFlags: ['--proxy', '--anthropic', '-a'],
+  optionalValueFlags: ['--chrome-mcp'],
+  valueFlags: ['--chrome-mcp-profile'],
+});
 if (parsedArgs.flags['--proxy']) proxyEnabled = true;
 const anthropicEnabled = parsedArgs.flags['--anthropic'] || parsedArgs.flags['-a'];
+const chromeOption = parsedArgs.flags['--chrome-mcp'];
+const chromeProfileName = parsedArgs.flags['--chrome-mcp-profile'] ||
+  (typeof chromeOption === 'string' ? chromeOption : undefined);
+const chromeEnabled = Boolean(chromeOption || chromeProfileName);
 const { extraVolumes, extraPublish } = parsedArgs;
 const attachMode = parsedArgs.passthroughArgs[0] === 'attach';
 const extraPiArgs = attachMode ? parsedArgs.passthroughArgs.slice(1) : parsedArgs.passthroughArgs;
@@ -73,8 +80,8 @@ const herdrBridgeHost = process.env.PIC_HERDR_BRIDGE_HOST || host;
 const herdrBridgeRequestedPort = Number(process.env.PIC_HERDR_BRIDGE_PORT || 0);
 const herdrBridgeSocketPath = `/tmp/herdr-${String(process.env.HERDR_PANE_ID || 'pane').replace(/[^a-zA-Z0-9_.-]/g, '-')}.sock`;
 
-function proxyEnvironmentArgs() {
-  return buildProxyEnvironmentArgs(proxyUrl, { enabled: proxyEnabled });
+function proxyEnvironmentArgs(url) {
+  return buildProxyEnvironmentArgs(url, { enabled: proxyEnabled });
 }
 
 // Anthropic env keys to forward into the container. The container does not
@@ -152,6 +159,15 @@ function providerEnvironmentArgs() {
     log(`warning: ${missing.join(', ')} unset and absent from ${envPath}; those providers send an empty key`);
   }
   return Object.entries(values).flatMap(([name, value]) => ['-e', `${name}=${value}`]);
+}
+
+function chromeEnvironmentArgs(chromeBridge) {
+  if (!chromeBridge) return [];
+  return [
+    '-e', `PIC_CHROME_BRIDGE_HOST=${host}`,
+    '-e', `PIC_CHROME_BRIDGE_PORT=${chromeBridge.port}`,
+    '-e', `PIC_CHROME_BRIDGE_TOKEN=${chromeBridge.token}`,
+  ];
 }
 
 function herdrEnvironmentArgs() {
@@ -256,7 +272,7 @@ function maybeRenameHerdrAgent() {
   }
 }
 async function startProxy() {
-  return startProxyWithFallback({ host, port, proxyUrl, verbose, log, logPrefix: commandName });
+  return startProxyWithFallback({ host, port, verbose, log, logPrefix: commandName });
 }
 
 function startHerdrHostBridge() {
@@ -478,6 +494,11 @@ function findContainerWithMount(workdirPath) {
 
 async function main() {
   if (!home) throw new Error('HOME is not set');
+  if (typeof chromeOption === 'string' && parsedArgs.flags['--chrome-mcp-profile'] &&
+      chromeOption !== parsedArgs.flags['--chrome-mcp-profile']) {
+    throw new Error('Conflicting Chrome profile names');
+  }
+  if (chromeEnabled && attachMode) throw new Error('--chrome-mcp requires a Pi run, not attach');
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
   stageHostSkills();
@@ -499,6 +520,14 @@ async function main() {
     ? await startProxy()
     : { server: null, started: false };
   const herdrBridge = await startHerdrHostBridge();
+  let chromeBridge;
+  try {
+    if (chromeEnabled) chromeBridge = await startChromeBridge({ host, log, profileName: chromeProfileName });
+  } catch (error) {
+    if (herdrBridge.started) await stopServer(herdrBridge.server, herdrBridge.sockets);
+    if (proxy.started && proxy.server) await proxy.server.close(true);
+    throw error;
+  }
   if (!proxyEnabled) log('proxy disabled; clearing proxy environment for the Pi process');
   let cleanedUp = false;
 
@@ -513,11 +542,17 @@ async function main() {
       log('stopping Herdr bridge');
       await stopServer(herdrBridge.server, herdrBridge.sockets);
     }
+    if (chromeBridge) {
+      log(chromeProfileName === 'clanker' ? 'disconnecting Chrome Agent; leaving its window open' :
+        chromeProfileName ? `closing Chrome; keeping profile "${chromeProfileName}"` :
+          'closing temporary Chrome and deleting its profile');
+      await chromeBridge.close();
+    }
   }
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }), ...providerEnvironmentArgs()];
+    const envArgs = [...proxyEnvironmentArgs(proxy.url), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }), ...providerEnvironmentArgs()];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -548,25 +583,27 @@ async function main() {
     const commandArgs = containerExecPiCommand(piArgs);
     const args = containerExecArgs(existingContainerId, commandArgs, {
       envArgs: [
-        ...proxyEnvironmentArgs(),
+        ...proxyEnvironmentArgs(proxy.url),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...providerEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
+        ...chromeEnvironmentArgs(chromeBridge),
       ],
     });
 
-    log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
+    log(`exec: container ${existingContainerId} ... pi --session-dir ...`);
     runChildProcess('container', args, { cleanup });
   } else {
     const args = containerRunArgs(containerRunPiCommand(piArgs), {
       includeHerdrSocket: true,
       envArgs: [
-        ...proxyEnvironmentArgs(),
+        ...proxyEnvironmentArgs(proxy.url),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...providerEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
+        ...chromeEnvironmentArgs(chromeBridge),
       ],
     });
 

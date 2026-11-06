@@ -69,8 +69,9 @@ RUN curl -fsSL https://herdr.dev/install.sh | sh \
     && herdr --version
 
 COPY entrypoint.sh /usr/local/bin/entrypoint
+COPY chrome-mcp-adapter.cjs /usr/local/bin/pic-chrome-mcp
 COPY md2pdf /usr/local/bin/md2pdf
-RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/md2pdf
+RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/pic-chrome-mcp /usr/local/bin/md2pdf
 
 WORKDIR /workspace
 
