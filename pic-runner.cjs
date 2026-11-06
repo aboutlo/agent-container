@@ -12,6 +12,15 @@ const {
   runChildProcess,
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
+const { resolveProviderEnv } = require('./provider-env.cjs');
+
+function readTextIfExists(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
 
 const host = process.env.PIC_PROXY_HOST || '192.168.64.1';
 const port = Number(process.env.PIC_PROXY_PORT || 8888);
@@ -122,6 +131,27 @@ function anthropicEnvironmentArgs({ useAnthropic } = {}) {
   // shadow ANTHROPIC_API_KEY. entrypoint.sh honors PIC_EXCLUDE_AUTH=1 to skip it.
   if (any) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
   return args;
+}
+
+// Custom providers in the shared models.json carry "${PI_*_API_KEY}" instead of a
+// literal key, so no repo holds a credential. Pi resolves those names from the
+// process env and the container starts with a clean env, so forward every name
+// models.json references. Host env wins, then ~/.config/pi/providers.env.
+// Resolution rules live in provider-env.cjs, which has its own tests.
+function providerEnvironmentArgs() {
+  const modelsPath = path.join(home, '.pi', 'agent', 'models.json');
+  const envPath = process.env.PI_PROVIDERS_ENV || path.join(home, '.config', 'pi', 'providers.env');
+  const modelsText = readTextIfExists(modelsPath);
+  if (modelsText === null) return [];
+  const { values, missing } = resolveProviderEnv({
+    modelsText,
+    processEnv: process.env,
+    providersEnvText: readTextIfExists(envPath),
+  });
+  if (missing.length > 0) {
+    log(`warning: ${missing.join(', ')} unset and absent from ${envPath}; those providers send an empty key`);
+  }
+  return Object.entries(values).flatMap(([name, value]) => ['-e', `${name}=${value}`]);
 }
 
 function herdrEnvironmentArgs() {
@@ -487,7 +517,7 @@ async function main() {
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled })];
+    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }), ...providerEnvironmentArgs()];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
@@ -520,6 +550,7 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...providerEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
@@ -533,6 +564,7 @@ async function main() {
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+        ...providerEnvironmentArgs(),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
