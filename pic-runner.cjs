@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const net = require('node:net');
+const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -13,6 +14,17 @@ const {
   startProxy: startProxyWithFallback,
 } = require('./runner-utils.cjs');
 const { resolveProviderEnv } = require('./provider-env.cjs');
+const {
+  commandKeyProviderIds,
+  containerNameFor,
+  keysEnvArgs,
+  keysGateArgs,
+  keysMountArgs,
+  keysTransportDefault,
+  missingCommandKeys,
+  tmpfsMountArgs,
+} = require('./provider-keys.cjs');
+const { tcpReachable, tunnelOnlyHosts, tunnelWarning } = require('./provider-reachability.cjs');
 
 function readTextIfExists(file) {
   try {
@@ -54,6 +66,22 @@ const nodeModulesVolume = `pic-${volumeBasename}-${volumeSuffix}-node-modules`;
 // Session directory — pi writes UUID-named session files, no hash needed for isolation
 // Two pi processes in the same container won't collide because session IDs are UUIDs.
 const sessionDir = `${workspaceTarget}/.pi/agent/sessions`;
+
+// Provider keys: one 0600 file per provider id under ~/.config/pi/keys, mounted read-only
+// into the container. models.json points at them with
+// `!cat "${PI_KEY_DIR:-$HOME/.config/pi/keys}/<id>"` so pi resolves them without any export
+// on the host and without any secret on the container command line. The directory lives
+// outside ~/.pi on purpose: ~/.pi is bind-mounted whole at /host-pi, so keys inside it would
+// be reachable in the container at a second, undocumented path. See pic-keys.
+const providerKeysHostDir = process.env.PIC_KEYS_HOST_DIR || path.join(home || '', '.config', 'pi', 'keys');
+const providerKeysContainerDir = process.env.PIC_PROVIDER_KEYS_DIR || '/run/pi-keys';
+// 'tmpfs' (default): guest RAM, filled by pic-keys-inject.cjs over exec stdin after start,
+// so no secret is written to disk on either side. 'bind': mount the host key directory
+// read-only instead (keys stay on disk). 'off': nothing at all.
+const providerKeysTransport = (process.env.PIC_KEYS_TRANSPORT || keysTransportDefault).toLowerCase();
+// Upper bound for the entrypoint's wait for the keys, in seconds. Bounded on purpose: a
+// locked vault or a dead injector must not hang the session.
+const providerKeysWaitSeconds = Number(process.env.PIC_KEYS_WAIT ?? 25);
 const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
 const stagedHostExtensionsDir = path.join(workdir, '.pi', 'host-agent-extensions');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
@@ -133,10 +161,12 @@ function anthropicEnvironmentArgs({ useAnthropic } = {}) {
   return args;
 }
 
-// Custom providers in the shared models.json carry "${PI_*_API_KEY}" instead of a
-// literal key, so no repo holds a credential. Pi resolves those names from the
-// process env and the container starts with a clean env, so forward every name
-// models.json references. Host env wins, then ~/.config/pi/providers.env.
+// Support, not the default: a models.json that interpolates "${PI_*_API_KEY}" names is
+// resolved (host env, then ~/.config/pi/providers.env) and forwarded as `-e NAME=<value>`.
+// Those values are recorded by Apple container in `container inspect` and in a
+// world-readable config.json under ~/Library/Application Support, so prefer the file form:
+// ~/.config/pi/keys/<provider> plus a "!cat" apiKey command (see pic-keys), which keeps the
+// secret off the command line entirely.
 // Resolution rules live in provider-env.cjs, which has its own tests.
 function providerEnvironmentArgs() {
   const modelsPath = path.join(home, '.pi', 'agent', 'models.json');
@@ -151,7 +181,122 @@ function providerEnvironmentArgs() {
   if (missing.length > 0) {
     log(`warning: ${missing.join(', ')} unset and absent from ${envPath}; those providers send an empty key`);
   }
+  const forwarded = Object.keys(values);
+  if (forwarded.length > 0) {
+    log(`note: forwarding ${forwarded.join(', ')} with -e; prefer ~/.config/pi/keys/<provider> plus a "!cat" apiKey (see pic-keys) so no key reaches the container command line`);
+  }
   return Object.entries(values).flatMap(([name, value]) => ['-e', `${name}=${value}`]);
+}
+
+// Providers whose apiKey is `!command` are the only ones needing a key at all.
+function providerKeyProviders() {
+  const modelsText = readTextIfExists(path.join(home || '', '.pi', 'agent', 'models.json'));
+  return commandKeyProviderIds(modelsText || '');
+}
+
+// True when this launcher is responsible for putting the keys inside the container itself
+// (tmpfs transport). Read-only bind or off means the container reads host files instead.
+function shouldInjectProviderKeys() {
+  return providerKeysTransport === 'tmpfs' && providerKeyProviders().length > 0;
+}
+
+function providerKeysMountArgs({ inject = false } = {}) {
+  if (providerKeysTransport === 'off') return [];
+  if (inject) return tmpfsMountArgs({ containerDir: providerKeysContainerDir });
+  return keysMountArgs({ keysDir: providerKeysHostDir, containerDir: providerKeysContainerDir });
+}
+
+// Inside the container the same models.json line reads $PI_KEY_DIR/<provider> instead of
+// reaching for a secret manager that cannot run there. The gate is only asked for when this
+// launcher injects the keys, otherwise pi would wait for a marker nobody writes.
+function providerKeysEnvArgs({ inject = false } = {}) {
+  const args = keysEnvArgs({
+    keysDir: providerKeysHostDir,
+    containerDir: providerKeysContainerDir,
+    transport: providerKeysTransport,
+  });
+  return inject ? [...args, ...keysGateArgs({ waitSeconds: providerKeysWaitSeconds })] : args;
+}
+
+// Run alongside `container run`: waits for the container, pipes each key into the tmpfs
+// through `container exec -i` stdin, then releases the entrypoint gate. Values never reach
+// argv or a file. The child is detached so the interactive container keeps its terminal.
+let providerKeyInjectorLog = null;
+
+function spawnProviderKeyInjector(target) {
+  if (!target) return;
+  const args = [
+    path.join(__dirname, 'pic-keys-inject.cjs'),
+    target,
+    // The injector's clock starts before `container run`, so its budget has to cover image
+    // unpacking and VM boot as well; the entrypoint's gate only has to cover the write.
+    '--wait',
+    String(providerKeysWaitSeconds + 180),
+  ];
+  let stdio = 'inherit';
+  if (verbose !== true && process.env.PIC_KEYS_VERBOSE !== '1') {
+    // Pi owns the terminal from here on: a message printed over its TUI corrupts the screen,
+    // so the injector writes to a log that is reported after Pi exits.
+    providerKeyInjectorLog = path.join(os.tmpdir(), `${commandName}-keys-${target}.log`);
+    const fd = fs.openSync(providerKeyInjectorLog, 'w');
+    stdio = ['ignore', fd, fd];
+  }
+  const child = spawn(process.execPath, args, { detached: true, stdio });
+  child.on('error', (error) => log(`warning: could not start the key injector: ${error.message}`));
+  child.unref();
+}
+
+function reportProviderKeyInjector() {
+  if (!providerKeyInjectorLog) return;
+  let text = '';
+  try {
+    text = fs.readFileSync(providerKeyInjectorLog, 'utf8');
+  } catch {
+    return;
+  }
+  for (const line of text.split('\n')) if (line.trim()) console.error(line.trim());
+}
+
+function providerKeysWarningTarget() {
+  return shouldInjectProviderKeys() ? 'live read at launch' : providerKeysHostDir;
+}
+
+// A `!…` apiKey needs either the host key file or a host that can run its command. In tmpfs
+// mode pic reads it live at launch, so a missing file is normal; in bind mode the provider
+// would silently vanish from /model, so warn before launching.
+function warnMissingProviderKeys() {
+  const modelsText = providerModelsText();
+  if (!modelsText) return;
+  const missing = missingCommandKeys({ modelsText, keysDir: providerKeysHostDir });
+  if (missing.length === 0) return;
+  if (providerKeysTransport === 'tmpfs') {
+    log(`provider keys read live at launch: ${missing.map((entry) => entry.providerId).join(', ')}`);
+    return;
+  }
+  for (const { providerId, target, uri } of missing) {
+    log(`warning: ${target} is missing, so ${providerId} resolves only where its apiKey command can run`);
+    if (uri) log(`         live read: ${uri} (pic-keys ${providerId} writes the key file)`);
+  }
+}
+
+// The models.json text, or '' when there is none.
+function providerModelsText() {
+  return readTextIfExists(path.join(home || '', '.pi', 'agent', 'models.json')) || '';
+}
+
+// A provider behind a host-only tunnel (WireGuard, Tailscale, any utun) is reachable from
+// this host and unreachable from a container: the VM's packets keep the VM's source address
+// and macOS does not SNAT into a utun, so the peer drops them. Pi's 10s connect timeout then
+// looks like a bad credential, so name the real cause before the session starts.
+async function warnUnreachableProviders() {
+  if (proxyEnabled) return; // already dialing from the host, which owns the tunnel
+  for (const entry of tunnelOnlyHosts(providerModelsText())) {
+    if (await tcpReachable({ host: entry.host, port: entry.port })) {
+      log(tunnelWarning(entry, commandName));
+    } else {
+      log(`warning: ${entry.host}:${entry.port} is unreachable from this host too (providers: ${entry.providers.join(', ')})`);
+    }
+  }
 }
 
 function herdrEnvironmentArgs() {
@@ -337,15 +482,18 @@ function containerExecArgs(containerId, commandArgs, { envArgs = [] } = {}) {
   ];
 }
 
-function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = false } = {}) {
+function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = false, injectKeys = false, containerName } = {}) {
   return [
     'run', '--rm', ...interactiveContainerArgs(), '--memory', '4g',
+    // A stable name lets pic-keys-inject.cjs address the container while it still boots.
+    ...(containerName ? ['--name', containerName] : []),
     '--volume', `${workdir}:${workspaceTarget}`,
     '--mount', `type=volume,source=${nodeModulesVolume},target=${workspaceTarget}/node_modules`,
     ...extraVolumes.flatMap(v => ['--volume', v]),
     ...(includeHerdrSocket ? herdrSocketVolumeArgs() : []),
     ...extraPublish.flatMap(p => ['--publish', p]),
     '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+    ...providerKeysMountArgs({ inject: injectKeys }),
     '--dns', '1.1.1.1',
     ...envArgs,
     '-w', workspaceTarget,
@@ -480,6 +628,8 @@ async function main() {
   if (!home) throw new Error('HOME is not set');
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
+  warnMissingProviderKeys();
+  await warnUnreachableProviders();
   stageHostSkills();
   stageHostExtensions();
 
@@ -513,14 +663,26 @@ async function main() {
       log('stopping Herdr bridge');
       await stopServer(herdrBridge.server, herdrBridge.sockets);
     }
+    // Key-injector messages cannot be printed while the TUI owns the terminal, so they are
+    // collected in a log and reported once Pi is gone.
+    reportProviderKeyInjector();
   }
+
+  const injectKeys = shouldInjectProviderKeys();
+  const keysTarget = existingContainerId || containerNameFor({ prefix: commandName, volumeSuffix });
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
-    const envArgs = [...proxyEnvironmentArgs(), ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }), ...providerEnvironmentArgs()];
+    const envArgs = [
+      ...proxyEnvironmentArgs(),
+      ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
+      ...providerEnvironmentArgs(),
+      ...providerKeysEnvArgs({ inject: injectKeys }),
+    ];
 
     if (existingContainerId) {
       warnIgnoredRunOnlyArgs(existingContainerId);
+      if (injectKeys) spawnProviderKeyInjector(keysTarget);
       const args = containerExecArgs(existingContainerId, shellArgs, { envArgs });
 
       log(`attach: container exec ${existingContainerId} ${shellArgs.join(' ')}`);
@@ -528,9 +690,10 @@ async function main() {
       return;
     }
 
-    const args = containerRunArgs(shellArgs, { envArgs });
+    const args = containerRunArgs(shellArgs, { envArgs, injectKeys, containerName: keysTarget });
 
     log(`attach: starting shell in new container at ${workspaceTarget}`);
+    if (injectKeys) spawnProviderKeyInjector(keysTarget);
     runChildProcess('container', args, { cleanup });
     return;
   }
@@ -551,25 +714,31 @@ async function main() {
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...providerEnvironmentArgs(),
+        ...providerKeysEnvArgs({ inject: injectKeys }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
     });
 
     log(`exec: container ${args.slice(1, -piArgs.length - 1).join(' ')} ... pi --session-dir ...`);
+    if (injectKeys) spawnProviderKeyInjector(keysTarget);
     runChildProcess('container', args, { cleanup });
   } else {
     const args = containerRunArgs(containerRunPiCommand(piArgs), {
       includeHerdrSocket: true,
+      injectKeys,
+      containerName: keysTarget,
       envArgs: [
         ...proxyEnvironmentArgs(),
         ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
         ...providerEnvironmentArgs(),
+        ...providerKeysEnvArgs({ inject: injectKeys }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
       ],
     });
 
+    if (injectKeys) spawnProviderKeyInjector(keysTarget);
     runChildProcess('container', args, { cleanup });
   }
 }

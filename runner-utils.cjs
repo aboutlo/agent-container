@@ -42,9 +42,15 @@ function parseContainerRunnerArgs(cliArgs, { booleanFlags = [] } = {}) {
   return { flags, extraVolumes, extraPublish, passthroughArgs };
 }
 
-function proxyEnvironmentArgs(proxyUrl, { enabled = true } = {}) {
+// With the proxy enabled, export the proxy for every spelling. With it disabled, only emit an
+// empty assignment for a variable the caller actually exported: that is what "clear the proxy
+// environment" means, and it keeps a proxy-less container's recorded configuration free of
+// six empty variables that a later `pic-proxy` exec has to override.
+function proxyEnvironmentArgs(proxyUrl, { enabled = true, env = process.env } = {}) {
   const value = enabled ? proxyUrl : '';
-  const args = proxyEnvironmentNames.flatMap(name => ['-e', `${name}=${value}`]);
+  const args = proxyEnvironmentNames
+    .filter((name) => enabled || env[name] !== undefined)
+    .flatMap((name) => ['-e', `${name}=${value}`]);
   if (enabled) {
     // The OpenAI Node SDK/undici fetch stack does not automatically honor
     // HTTP_PROXY/http_proxy. Preload an undici EnvHttpProxyAgent so Pi's

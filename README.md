@@ -9,6 +9,7 @@ Run **Pi** (the Pi coding agent) or **Claude Code** inside an Apple container wh
 | `pic` | Containerized Pi with direct networking. |
 | `pic --proxy` | Containerized Pi through the host-side proxy. |
 | `pic-proxy` | Compatibility alias for `pic --proxy`. |
+| `pic-keys` | Status or refresh of the provider key files in `~/.config/pi/keys`. |
 | `clc-proxy` | Claude Code with host-side proxy, persistent Linux auth, and host-inspectable sessions. |
 
 ## Requirements
@@ -104,6 +105,135 @@ Personal agent preferences:
   it gitignored. Do not use `.claude.local.md`; Claude Code does not load that
   as a standard memory file.
 
+
+## Provider API Keys
+
+`~/.pi/agent/models.json` resolves its own keys. Each provider's `apiKey` is a command, so
+neither the repo, the shell, nor the container configuration ever holds the value:
+
+```json
+"apiKey": "!cat \"${PI_KEY_DIR:-$HOME/.config/pi/keys}/omlx-clanker\" 2>/dev/null || op read \"op://Private/OMLX_API_KEY/credential\""
+```
+
+| Where | What answers | On disk |
+|---|---|---|
+| native `pi` | the `op read` fallback: live from 1Password per process | nothing |
+| native `pi`, with a key file present | `cat ~/.config/pi/keys/<provider>` (a cache, opt-in) | 0600 file |
+| `pic` / `pic-proxy` | `cat /run/pi-keys/<provider>` — a **tmpfs** the launcher fills after start | nothing |
+
+How the container gets the key without it being declared anywhere (`PIC_KEYS_TRANSPORT=tmpfs`,
+the default):
+
+1. `pic` names the container (`pic-<workdir suffix>`) and adds `--tmpfs /run/pi-keys`, plus
+   `PI_KEY_DIR=/run/pi-keys` and `PIC_KEYS_WAIT=<seconds>`.
+2. The entrypoint's `pi` branch waits for `/run/pi-keys/.ready`, bounded by `PIC_KEYS_WAIT`
+   (25s by default) — pi resolves an `apiKey` once and caches it for its whole process, so a
+   race would silently drop the provider for the session.
+3. In parallel, `pic-keys-inject.cjs` resolves each key **on the host** by running the very
+   command from models.json (with `PI_KEY_DIR` unset, exactly as native pi would), waits for
+   the container to be running, pipes each value through `container exec -i` stdin into the
+   tmpfs (mode 0600), then touches `.ready`.
+
+The value therefore exists only in this process' memory and in guest RAM: not in argv (which
+lands in logs), not in `config.json`, not in the image, not on the VM's disk image. Stop the
+container and it is gone. A provider whose live read fails is reported by name at launch and
+simply stays unavailable; the session still starts.
+
+One caveat decides whether you can delete the key files entirely: **a secret manager can only
+answer where it can get authorization.** 1Password's desktop integration answers in an
+interactive shell and refuses from a non-interactive one (`op read` → `promptError`, seen from
+an agent's shell, cron, or a GUI launcher, with the app running and the account registered). So:
+
+* you launch `pic` from your own terminal → no key file needed, nothing stored
+* agents or other headless contexts launch `pic` → keep `~/.config/pi/keys/<provider>` as a
+  cache, or that provider is unavailable in the container (the read is bounded by
+  `PIC_KEY_READ_TIMEOUT`, 12s, so a manager waiting on an approval dialog cannot stall a launch)
+
+Injector messages go to `$TMPDIR/<command>-keys-<container>.log` and are printed after Pi
+exits, because writing to the terminal over Pi's TUI corrupts the screen. `PIC_KEYS_VERBOSE=1`
+prints them live instead, for debugging.
+
+```bash
+pic-keys                    # status; in the default transport nothing is stored, by design
+pic-keys --verify           # read live, compare hashes: proves the URI and the authorization
+pic-keys omlx-clanker       # write ~/.config/pi/keys/<provider> (opt-in cache / bind transport)
+pic-keys omlx-clanker "op://Vault/Item/Field"   # first time, or after a rotation
+pic-keys --all
+```
+
+Files, when you choose to have them, are written 0600 in a 0700 directory through a temp file
+and a rename. The value is never printed, never a command-line argument, never exported. For an
+API-credential item the 1Password field is `credential`, singular. Pi caches a resolved key for
+the lifetime of its process, so test with a fresh process, and note that `pi --list-models`
+never validates a key.
+
+Why not `-e NAME=<key>` (measured on Apple container 1.7.1):
+
+* `-e` values appear verbatim in `container inspect` and `container list --format json`, and are
+  written to `~/Library/Application Support/com.apple.container/containers/<id>/config.json`
+  with mode **0644** for the life of the container. `--env-file` changes nothing, and
+  `pi --api-key` is recorded in `initProcess.arguments` too.
+* `vminitd` logs the environment of the workload and of every `container exec` at debug level
+  (apple/containerization#518; the `op run … container exec --env` pattern is apple/container
+  discussion #1153).
+* Inside the container the environment is readable by every process Pi spawns, including the
+  agent's own shell tool.
+
+A read-only bind mount of a host key directory (`PIC_KEYS_TRANSPORT=bind`) records only the
+directory path, which is why `~/.config/pi/keys` sits outside `~/.pi`: `~/.pi` is mounted whole
+at `/host-pi`, so keys inside it would be reachable at a second path. Use it when the host shell
+cannot reach 1Password. Containers created before the tmpfs default still carry the old
+read-only mount; `pic` says so and prints the `container stop <id>` to run.
+
+Re-run the whole proof (pty launch, tmpfs check, hash comparison, host-side leak scan):
+
+```bash
+./key-injection-check.sh            # uses a throwaway workdir under /tmp
+```
+
+Knobs: `PIC_KEYS_TRANSPORT` (`tmpfs` | `bind` | `off`), `PIC_KEYS_WAIT` (gate seconds, `0`
+disables), `PIC_KEY_READ_TIMEOUT` (seconds for one live read), `PIC_KEYS_HOST_DIR`,
+`PIC_PROVIDER_KEYS_DIR`, `PIC_KEYS_VERBOSE=1`, and `OP_BIN` (`pic-keys` only; `models.json`
+names the binary itself).
+
+The legacy form is still supported: if `models.json` interpolates `${NAME}` names, they are
+resolved from the host environment, then from `~/.config/pi/providers.env`, and forwarded with
+`-e` — with the exposure above, which the runner logs as a note. Nothing in the dotfiles uses it
+any more. Rules and tests live in `provider-env.cjs`; the file form in `provider-keys.cjs`,
+`pic-keys.cjs` and `pic-keys-inject.cjs`.
+
+## Provider reachability: tunnels need the host proxy
+
+A model server whose address is reachable only through a host-only tunnel (WireGuard,
+Tailscale, any `utun`) **cannot be reached from a container**, and `pic` says so before Pi
+starts instead of letting you sit through a connect timeout:
+
+```
+warning: 172.31.221.1 is reachable only through utun1 on this host, so a container cannot
+         connect to it (the peer sees the VM's address and drops it). Providers affected: omlx-clanker.
+         run it through the host-side proxy instead: pic --proxy   (or simply pic-proxy)
+```
+
+Measured on this machine with `http://172.31.221.1:8080`:
+
+| Path | Result |
+|---|---|
+| host `curl` | `200` |
+| container, direct | connect timeout |
+| container through the host proxy (`pic-proxy`) | `401`/`200` (reached the server) |
+| container, general internet | `200` |
+
+`net.inet.ip.forwarding=1` does not help: the host forwards the VM's packets into the tunnel
+with the VM's source address and does not SNAT them, so the peer drops the reply. Only sockets
+owned by the host get the tunnel address - which is exactly what `pic-proxy`'s proxy-chain
+instance provides: it dials from the host, so tunnel, VPN and LAN-only hosts all work. Use it
+for any provider living behind a tunnel; the detection is host-side (`route -n get`), needs one
+second at most, and stays quiet when the proxy is already enabled. Rules and tests live in
+`provider-reachability.cjs`.
+
+When the proxy is off, empty proxy variables are exported only for names the caller actually
+set, so a container that starts without a proxy does not carry six blank `-e` entries that a
+later `pic-proxy` exec has to override.
 
 ## Run
 

@@ -44,9 +44,11 @@ case "${1:-}" in
       rm -rf /root/.pi
       mkdir -p /root/.pi
       # Build the exclude list as a single word-split string (no spaces in the
-      # patterns). When the runner passes PIC_EXCLUDE_AUTH=1 (an Anthropic key
-      # env was provided), also drop auth.json so the env key wins over any
-      # stored credential instead of being shadowed by it.
+      # patterns). When the runner passes PIC_EXCLUDE_AUTH=1 (an Anthropic key env was
+      # provided), also drop auth.json so the env key wins over any stored credential
+      # instead of being shadowed by it. Provider keys never appear here: they are piped
+      # into a tmpfs at /run/pi-keys after start (see pic-keys-inject.cjs), so there is
+      # nothing to exclude from the ~/.pi copy.
       _pi_excludes="--exclude=./agent/bin --exclude=./agent/sessions --exclude=./agent/npm --exclude=./agent/git --exclude=./agent/skills --exclude=./agent/extensions --exclude=./agent/settings.json.lock --exclude=./agent/auth.json.lock"
       if [ "${PIC_EXCLUDE_AUTH:-0}" = "1" ]; then
         _pi_excludes="$_pi_excludes --exclude=./agent/auth.json"
@@ -191,6 +193,25 @@ EOF
         [ -f "$extension" ] || continue
         set -- -e "$extension" "$@"
       done
+    fi
+
+    # Provider keys are piped in after start (pic runs pic-keys-inject alongside the
+    # container), so wait for the ready marker: pi resolves an apiKey once and caches it for
+    # its whole process, so a race would make the provider vanish for the session. The wait
+    # is bounded, and the session still starts without the key rather than hanging.
+    if [ -n "${PI_KEY_DIR:-}" ] && [ "${PIC_KEYS_WAIT:-0}" != "0" ] && [ ! -e "$PI_KEY_DIR/.ready" ]; then
+      echo "[pi-container] waiting for provider keys in $PI_KEY_DIR (up to ${PIC_KEYS_WAIT}s)"
+      _key_ticks=$(( PIC_KEYS_WAIT * 5 ))
+      _key_try=0
+      while [ ! -e "$PI_KEY_DIR/.ready" ] && [ "$_key_try" -lt "$_key_ticks" ]; do
+        sleep 0.2
+        _key_try=$((_key_try + 1))
+      done
+      if [ -e "$PI_KEY_DIR/.ready" ]; then
+        echo "[pi-container] provider keys ready"
+      else
+        echo "[pi-container] warning: no keys after ${PIC_KEYS_WAIT}s; starting without them"
+      fi
     fi
 
     exec pi "$@"
