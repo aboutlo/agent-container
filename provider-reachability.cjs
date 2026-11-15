@@ -82,10 +82,13 @@ function tunnelOnlyHosts(modelsText, { spawn = spawnSync, platform = process.pla
 
 function tunnelWarning(entry, commandName) {
   const proxyCommand = commandName === 'pic' ? 'pic --proxy   (or simply pic-proxy)' : `${commandName} --proxy`;
+  // A tunneled provider is not an exception worth repeating on every launch, so say what to
+  // change once.
+  const alias = commandName === 'pic' ? '\n         if that is your only provider, make it the default: alias pic=\"pic --proxy\"' : '';
   return (
     `warning: ${entry.host} is reachable only through ${entry.iface} on this host, so a container ` +
     `cannot connect to it (the peer sees the VM's address and drops it). Providers affected: ${entry.providers.join(', ')}.`
-  ) + `\n         run it through the host-side proxy instead: ${proxyCommand}`;
+  ) + `\n         run it through the host-side proxy instead: ${proxyCommand}${alias}`;
 }
 
 module.exports = {

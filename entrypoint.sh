@@ -202,21 +202,41 @@ EOF
     fi
 
     # Provider keys are piped in after start (pic runs pic-keys-inject alongside the
-    # container), so wait for the ready marker: pi resolves an apiKey once and caches it for
-    # its whole process, so a race would make the provider vanish for the session. The wait
-    # is bounded, and the session still starts without the key rather than hanging.
+    # container), so wait for a verdict marker: pi resolves an apiKey once and caches it for its
+    # whole process, so a race would make the provider vanish for the session.
+    #
+    # No verdict, or a failed one, ends the launch. Starting anyway produced a session that died
+    # on the first message with "API key auth failed for provider ...", which reads like a
+    # container or provider fault while the real cause was a locked secret manager on the host.
+    # PIC_KEYS_REQUIRED=0 restores the old start-anyway behaviour.
     if [ -n "${PI_KEY_DIR:-}" ] && [ "${PIC_KEYS_WAIT:-0}" != "0" ] && [ ! -e "$PI_KEY_DIR/.ready" ]; then
       echo "[pi-container] waiting for provider keys in $PI_KEY_DIR (up to ${PIC_KEYS_WAIT}s)"
       _key_ticks=$(( PIC_KEYS_WAIT * 5 ))
       _key_try=0
-      while [ ! -e "$PI_KEY_DIR/.ready" ] && [ "$_key_try" -lt "$_key_ticks" ]; do
+      while [ ! -e "$PI_KEY_DIR/.ready" ] && [ ! -e "$PI_KEY_DIR/.failed" ] && [ "$_key_try" -lt "$_key_ticks" ]; do
         sleep 0.2
         _key_try=$((_key_try + 1))
       done
+      _keys_failed=''
       if [ -e "$PI_KEY_DIR/.ready" ]; then
         echo "[pi-container] provider keys ready"
+      elif [ -e "$PI_KEY_DIR/.failed" ]; then
+        _keys_failed=$(tr '\n' ' ' < "$PI_KEY_DIR/.failed")
+        echo "[pi-container] no provider key could be read on the host for: ${_keys_failed}" >&2
       else
-        echo "[pi-container] warning: no keys after ${PIC_KEYS_WAIT}s; starting without them"
+        _keys_failed="${PIC_KEYS_EXPECTED:-the configured providers}"
+        echo "[pi-container] the key injector reported nothing within ${PIC_KEYS_WAIT}s" >&2
+      fi
+      if [ -n "$_keys_failed" ] && [ "${PIC_KEYS_REQUIRED:-1}" != "0" ]; then
+        cat >&2 <<EOF
+[pi-container] session not started: no provider credential.
+  waiting on : ${_keys_failed}
+  usual cause: the secret manager could not answer in time (locked app, unanswered approval, wrong URI)
+  try        : unlock it and run pic again; a slow manager is worth PIC_KEYS_WAIT=180
+               or store a key file from a terminal where it can prompt: pic-keys <provider>
+  start anyway with no credential: PIC_KEYS_REQUIRED=0 pic ...
+EOF
+        exit 1
       fi
     fi
 

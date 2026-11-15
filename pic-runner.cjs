@@ -85,9 +85,12 @@ const providerKeysContainerDir = process.env.PIC_PROVIDER_KEYS_DIR || '/run/pi-k
 // so no secret is written to disk on either side. 'bind': mount the host key directory
 // read-only instead (keys stay on disk). 'off': nothing at all.
 const providerKeysTransport = (process.env.PIC_KEYS_TRANSPORT || keysTransportDefault).toLowerCase();
-// Upper bound for the entrypoint's wait for the keys, in seconds. Bounded on purpose: a
-// locked vault or a dead injector must not hang the session.
-const providerKeysWaitSeconds = Number(process.env.PIC_KEYS_WAIT ?? 25);
+// Upper bound for the entrypoint's wait for the keys, in seconds, and therefore how long the
+// launcher is willing to wait for a human to unlock a secret manager (the injector retries until
+// a few seconds before this expires). Bounded on purpose: a vault that stays locked must end the
+// launch with a clear error rather than hang it. The session is not started when it expires
+// without a credential (PIC_KEYS_REQUIRED=0 opts out of that).
+const providerKeysWaitSeconds = Number(process.env.PIC_KEYS_WAIT ?? 90);
 
 // ~/.pi is never mounted into a container: it holds agent/sessions (every transcript ever
 // recorded) and agent/auth.json (stored provider credentials), and a read-only mount is still
@@ -174,13 +177,24 @@ function shouldInjectSecrets({ anthropicEnabled } = {}) {
 // What goes on the container command line for secrets: names in tmpfs mode (nothing sensitive),
 // values only when injection is unavailable, with the old warning.
 function secretArgsForLaunch({ anthropicEnabled, injectSecrets } = {}) {
-  if (injectSecrets) return envExportArgs(secretNamesFor({ anthropicEnabled }));
+  const missingAnthropic = anthropicEnabled && !secretNamesFor({ anthropicEnabled }).some((name) => name.startsWith('ANTHROPIC_'));
+  // auth.json is no longer mounted, so there is no stored credential to fall back on: an
+  // unsatisfiable --anthropic has to be reported as a missing provider, not as "using local auth".
+  const noAnthropicKey = () =>
+    log(
+      'warning: --anthropic requested but no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN in the environment '
+        + 'and PI_ANTHROPIC_KEY_CMD produced nothing; the container has no stored credentials '
+        + '(~/.pi/agent/auth.json is not mounted), so pi will have no Anthropic provider',
+    );
+  if (injectSecrets) {
+    const names = secretNamesFor({ anthropicEnabled });
+    if (missingAnthropic) noAnthropicKey();
+    return envExportArgs(names);
+  }
   const values = resolveLegacySecretValues({ anthropicEnabled });
   const names = Object.keys(values);
   if (names.length === 0) {
-    if (anthropicEnabled) {
-      log('warning: --anthropic requested but no ANTHROPIC_* key in env and PI_ANTHROPIC_KEY_CMD produced nothing; using local auth');
-    }
+    if (anthropicEnabled) noAnthropicKey();
     return [];
   }
   log(`note: injecting is unavailable, so ${names.join(', ')} is passed with -e; the value is recorded in the container configuration (0644) and shown by container inspect`);
@@ -303,9 +317,12 @@ function spawnProviderKeyInjector(target) {
     path.join(__dirname, 'pic-keys-inject.cjs'),
     target,
     // The injector's clock starts before `container run`, so its budget has to cover image
-    // unpacking and VM boot as well; the entrypoint's gate only has to cover the write.
+    // unpacking and VM boot as well; --gate tells it when the entrypoint gives up, which is the
+    // deadline for reading keys.
     '--wait',
     String(providerKeysWaitSeconds + 180),
+    '--gate',
+    String(providerKeysWaitSeconds),
   ];
   let stdio = 'inherit';
   if (verbose !== true && process.env.PIC_KEYS_VERBOSE !== '1') {

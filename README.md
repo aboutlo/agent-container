@@ -127,7 +127,7 @@ the default):
 1. `pic` names the container (`pic-<workdir suffix>`) and adds `--tmpfs /run/pi-keys`, plus
    `PI_KEY_DIR=/run/pi-keys` and `PIC_KEYS_WAIT=<seconds>`.
 2. The entrypoint's `pi` branch waits for `/run/pi-keys/.ready`, bounded by `PIC_KEYS_WAIT`
-   (25s by default) — pi resolves an `apiKey` once and caches it for its whole process, so a
+   (90s by default) — pi resolves an `apiKey` once and caches it for its whole process, so a
    race would silently drop the provider for the session.
 3. In parallel, `pic-keys-inject.cjs` resolves each key **on the host** by running the very
    command from models.json (with `PI_KEY_DIR` unset, exactly as native pi would), waits for
@@ -179,7 +179,35 @@ in any recorded configuration on the host. If the transport cannot inject
 (`PIC_KEYS_TRANSPORT=bind|off`) the old `-e` behaviour is used and says so.
 
 Files, when you choose to have them, are written 0600 in a 0700 directory through a temp file
-and a rename. The value is never printed, never a command-line argument, never exported. For an
+and a rename.
+
+### No credential, no session
+
+Before this, a launch whose key read failed still started pi, and the session died on the first
+message with `API key auth failed for provider omlx-clanker: Failed to resolve API key ... from
+shell command`. That reads like a container or provider fault; the actual cause was a locked
+1Password on the host, several screens away. Now the injector writes `/run/pi-keys/.failed` with
+the provider names and the entrypoint refuses to exec pi:
+
+```
+[pi-container] session not started: no provider credential.
+  waiting on : omlx-clanker
+  usual cause: the secret manager could not answer in time (locked app, unanswered approval, wrong URI)
+  try        : unlock it and run pic again; a slow manager is worth PIC_KEYS_WAIT=180
+               or store a key file from a terminal where it can prompt: pic-keys <provider>
+  start anyway with no credential: PIC_KEYS_REQUIRED=0 pic ...
+```
+
+The launcher exits 1. One usable provider out of several is enough to start, and a request that
+asked only for environment secrets is judged on those. `PIC_KEYS_REQUIRED=0` restores the old
+behaviour.
+
+Because the wait is what a human unlocking a vault occupies, it is used rather than spent: reads
+are retried until ~5s before the gate expires, at 3s intervals, and the retry budget adapts to
+how long the read takes (a locked vault answers in 50ms so a 20s gate fits ~5 attempts; a read
+that burns its 30s budget gets few). Verified with a stub `op` that refuses twice and then
+answers: attempt 3 resolves, `.ready` is released, pi starts; with the stub always refusing, the
+session is refused with the message above and exit 1. The value is never printed, never a command-line argument, never exported. For an
 API-credential item the 1Password field is `credential`, singular. Pi caches a resolved key for
 the lifetime of its process, so test with a fresh process, and note that `pi --list-models`
 never validates a key.
@@ -209,7 +237,8 @@ Re-run the whole proof (pty launch, tmpfs check, hash comparison, host-side leak
 ```
 
 Knobs: `PIC_KEYS_TRANSPORT` (`tmpfs` | `bind` | `off`), `PIC_KEYS_WAIT` (gate seconds, `0`
-disables), `PIC_KEY_READ_TIMEOUT` (seconds for one live read), `PIC_HOST_PI_SNAPSHOT`,
+disables), `PIC_KEY_READ_TIMEOUT` (seconds for one live read), `PIC_KEYS_REQUIRED=0` (start even
+with no credential), `PIC_HOST_PI_SNAPSHOT`,
 `PIC_HOST_PI_SNAPSHOT_DIR`, `PIC_HOST_PI_EXTRA_EXCLUDES`, `PIC_KEYS_HOST_DIR`,
 `PIC_PROVIDER_KEYS_DIR`, `PIC_KEYS_VERBOSE=1`, and `OP_BIN` (`pic-keys` only; `models.json`
 names the binary itself).
@@ -257,7 +286,7 @@ mounts that read-only at `/host-pi`:
 | excluded from the snapshot | why |
 |---|---|
 | `agent/sessions` | transcripts: contains anything ever printed in a session |
-| `agent/auth.json` | stored credentials; use `pic --anthropic` or a model key |
+| `agent/auth.json` | stored credentials - so containers have **no** stored credentials: a provider must come from a key file, a live read, or `--anthropic` (your file is `{}`, so this changes nothing for you) |
 | `agent/npm`, `agent/git` | bound read-only at `/host-pi-npm` and `/host-pi-git` instead (node_modules and checkouts are not worth copying) |
 | `agent/skills`, `agent/extensions`, `agent/bin`, `*.lock` | staged into the workspace, dereferenced |
 
@@ -286,6 +315,19 @@ Measured on this machine with `http://172.31.221.1:8080`:
 | container, direct | connect timeout |
 | container through the host proxy (`pic-proxy`) | `401`/`200` (reached the server) |
 | container, general internet | `200` |
+
+If a tunneled provider is your only provider, make the proxy the default once instead of
+remembering the flag:
+
+```zsh
+alias pic='pic --proxy'     # in ~/.zshrc; the launch warning prints the same advice
+```
+
+The proxy is a host-side loop bound to `192.168.64.1` (the VM's gateway), so `pic --proxy` costs
+one local hop and a Node process on the host; it is not a network proxy and nothing leaves the
+machine. Plain `pic` still matters for providers that are *not* behind a tunnel (a LAN inference
+box, an internet API): those need no proxy, and `--proxy` would only add a hop and a port for
+the VM to reach.
 
 `net.inet.ip.forwarding=1` does not help: the host forwards the VM's packets into the tunnel
 with the VM's source address and does not SNAT them, so the peer drops the reply. Only sockets

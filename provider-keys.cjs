@@ -26,6 +26,7 @@ const fs = require('node:fs');
 
 const keysTransportDefault = 'tmpfs';
 const keysReadyFile = '.ready';
+const keysFailedFile = '.failed';
 
 // Provider ids of every model provider whose apiKey is externalised as `!command`.
 function commandKeyProviderIds(modelsText) {
@@ -91,7 +92,10 @@ function keysEnvArgs({ keysDir, containerDir, transport = keysTransportDefault, 
 
 // Seconds the entrypoint waits for the ready marker before starting pi regardless.
 function keysGateArgs({ waitSeconds }) {
-  return ['-e', `PIC_KEYS_WAIT=${waitSeconds}`];
+  const args = ['-e', `PIC_KEYS_WAIT=${waitSeconds}`];
+  // The verdict lives in the container, so the choice to start anyway has to travel with it.
+  if (process.env.PIC_KEYS_REQUIRED === '0') args.push('-e', 'PIC_KEYS_REQUIRED=0');
+  return args;
 }
 
 // Provider ids become file names inside the key tmpfs. Rather than mangle them (the
@@ -114,8 +118,12 @@ function keyTargetPath({ containerDir, providerId }) {
   return name ? `${containerDir}/${name}` : null;
 }
 
+function keysMarkerPath({ containerDir, marker = keysReadyFile }) {
+  return `${containerDir}/${marker}`;
+}
+
 function readyTargetPath({ containerDir }) {
-  return `${containerDir}/${keysReadyFile}`;
+  return keysMarkerPath({ containerDir, marker: keysReadyFile });
 }
 
 // Value goes to stdin, never to argv (argv lands in logs). `sh -c 'umask 0600; cat > f'`
@@ -127,16 +135,34 @@ function execWriteArgs({ container, target, umask = '0177' }) {
   return ['exec', '-i', container, 'sh', '-c', `umask ${umask}; cat > '${target}'`];
 }
 
-function execReadyArgs({ container, containerDir }) {
-  return ['exec', container, 'sh', '-c', `umask 0177; : > '${readyTargetPath({ containerDir })}'`];
+// Markers are written through stdin as well (the content of .failed is a list of provider ids).
+// The opposite marker is removed so a reused container cannot read a stale verdict from the
+// previous launch.
+function execMarkerArgs({ container, markerPath, otherPath, umask = '0177' }) {
+  if (!container || !markerPath) return [];
+  const remove = otherPath ? `rm -f '${otherPath}'; ` : '';
+  return ['exec', '-i', container, 'sh', '-c', `umask ${umask}; ${remove}cat > '${markerPath}'`];
 }
 
-// The read has to finish inside the entrypoint's gate (PIC_KEYS_WAIT, 25s), otherwise the
-// container starts without the key even though the read would have succeeded. A secret
-// manager waiting on an approval dialog is the slow case worth bounding.
+// Whether the session is worth starting: a container whose every command-key provider failed is
+// not a working pi, and the error pi itself reports ("Failed to resolve API key") points at the
+// container rather than at the host-side read that failed. Missing env secrets do not decide.
+function keysOutcome({ expected = [], failed = [] }) {
+  const expectedIds = expected.map(String);
+  const failedIds = expectedIds.filter((id) => failed.map(String).includes(id));
+  return {
+    usable: expectedIds.filter((id) => !failedIds.includes(id)),
+    failed: failedIds,
+    ok: expectedIds.length === 0 || failedIds.length < expectedIds.length,
+  };
+}
+
+// A human may have to unlock a secret manager or approve a touch prompt before the read can
+// answer, so a single attempt is not enough: the injector retries until the gate is about to
+// expire. The gate default has to cover that (see PIC_KEYS_WAIT in pic-runner).
 function keyReadTimeoutMs() {
   const seconds = Number(process.env.PIC_KEY_READ_TIMEOUT);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 12_000;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 30_000;
 }
 
 // Run a models.json `!command` apiKey on the host exactly as native pi would: PI_KEY_DIR
@@ -176,14 +202,17 @@ function providerKeyCommand(modelsText, providerId) {
 module.exports = {
   commandKeyProviderIds,
   containerNameFor,
-  execReadyArgs,
+  execMarkerArgs,
   execWriteArgs,
   keyReadTimeoutMs,
   keyCommandUri,
   keyFileName,
+  keysFailedFile,
   keyTargetPath,
   keysEnvArgs,
   keysGateArgs,
+  keysMarkerPath,
+  keysOutcome,
   keysMountArgs,
   keysReadyFile,
   keysTransportDefault,

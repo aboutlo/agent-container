@@ -5,11 +5,16 @@ const assert = require('node:assert');
 const {
   commandKeyProviderIds,
   containerNameFor,
-  execReadyArgs,
+  execMarkerArgs,
   execWriteArgs,
   keyCommandUri,
+  keyReadTimeoutMs,
   keysEnvArgs,
+  keysFailedFile,
   keysGateArgs,
+  keysReadyFile,
+  keysMarkerPath,
+  keysOutcome,
   keysMountArgs,
   keyTargetPath,
   missingCommandKeys,
@@ -109,13 +114,22 @@ test('injection writes over stdin to safe file names, then releases the gate', (
     '-c',
     "umask 0177; cat > '/run/pi-keys/omlx-clanker'",
   ]);
-  assert.deepStrictEqual(execReadyArgs({ container: 'pic-a1b2c3', containerDir: '/run/pi-keys' }), [
-    'exec',
-    'pic-a1b2c3',
-    'sh',
-    '-c',
-    "umask 0177; : > '/run/pi-keys/.ready'",
-  ]);
+  // A marker removes its opposite: a reused container must not see last launch's verdict.
+  assert.deepStrictEqual(
+    execMarkerArgs({
+      container: 'pic-a1b2c3',
+      markerPath: keysMarkerPath({ containerDir: '/run/pi-keys', marker: keysReadyFile }),
+      otherPath: keysMarkerPath({ containerDir: '/run/pi-keys', marker: keysFailedFile }),
+    }),
+    [
+      'exec',
+      '-i',
+      'pic-a1b2c3',
+      'sh',
+      '-c',
+      "umask 0177; rm -f '/run/pi-keys/.failed'; cat > '/run/pi-keys/.ready'",
+    ],
+  );
   assert.deepStrictEqual(execWriteArgs({ container: '', target: '/run/pi-keys/x' }), []);
 });
 
@@ -182,4 +196,22 @@ test('resolution failures report a reason and never a value', () => {
     const result = resolveKeyCommandValue({ apiKey, spawn: () => ({ status: 0, stdout: 'x' }) });
     assert.strictEqual(result.value, null, `refuses non-command apiKey ${apiKey}`);
   }
+});
+
+test('a session only starts when at least one provider key is usable', () => {
+  assert.deepStrictEqual(keysOutcome({ expected: [], failed: [] }), { usable: [], failed: [], ok: true },
+    'a container with no command-key providers is not blocked');
+  assert.strictEqual(keysOutcome({ expected: ['omlx-clanker'], failed: ['omlx-clanker'] }).ok, false);
+  assert.strictEqual(keysOutcome({ expected: ['a', 'b'], failed: ['a'] }).ok, true, 'one working provider is a session');
+  assert.deepStrictEqual(keysOutcome({ expected: ['a', 'b'], failed: ['a'] }).usable, ['b']);
+  assert.deepStrictEqual(keysOutcome({ expected: ['a'], failed: ['unrelated'] }).failed, [],
+    'a failure for a provider that was not expected is not reported');
+});
+
+test('one read gets enough time for a human to unlock a secret manager', () => {
+  delete process.env.PIC_KEY_READ_TIMEOUT;
+  assert.strictEqual(keyReadTimeoutMs(), 30_000);
+  process.env.PIC_KEY_READ_TIMEOUT = '5';
+  assert.strictEqual(keyReadTimeoutMs(), 5_000);
+  delete process.env.PIC_KEY_READ_TIMEOUT;
 });
