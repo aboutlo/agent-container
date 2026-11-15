@@ -202,6 +202,29 @@ resolved from the host environment, then from `~/.config/pi/providers.env`, and 
 any more. Rules and tests live in `provider-env.cjs`; the file form in `provider-keys.cjs`,
 `pic-keys.cjs` and `pic-keys-inject.cjs`.
 
+### When does the secret manager get asked
+
+* With a key file present: never, for this provider — the `cat` short-circuits the `||` and the
+  secret manager is never invoked. That is why no 1Password dialog appeared on your first run.
+* Without one: once per process that resolves the credential — once per `pic`/`pic-proxy`
+  invocation (the injector re-reads on the reuse path too, which is how a rotation lands) and
+  once per native `pi` process. Not per model request, and not per token.
+* `1Password has to be able to answer`: it refuses where it cannot get authorization
+  (`op read` → `promptError` from a non-interactive shell, cron, a GUI launcher), which is the
+  one reason to keep a key file on a machine where agents launch containers.
+* `pic-keys --verify` is the explicit, value-free check that a URI and its authorization work.
+
+### How long does a container, and the key inside it, live?
+
+`pic` runs `container run --rm`: the container exists while its main process (Pi, or the shell
+from `pic attach`) is alive, and is **deleted** as soon as that exits or you `container stop`
+it — `container ls -a` shows nothing and `container inspect` reports it gone. The keys live in a
+tmpfs inside the VM, so they disappear with it; nothing to scrub, nothing to shred. The only
+thing that outlives a container is the named `<workdir>-<hash>-node-modules` volume, which is
+deliberate: `container volume delete <name>` removes it. The entrypoint's gate and the reuse path
+mean a second `pic` in the same directory execs into the running container and refreshes the keys
+rather than starting a new one.
+
 ## Provider reachability: tunnels need the host proxy
 
 A model server whose address is reachable only through a host-only tunnel (WireGuard,
