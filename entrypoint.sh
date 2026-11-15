@@ -58,10 +58,16 @@ case "${1:-}" in
     fi
 
     mkdir -p /root/.pi/agent
-    if [ -d /host-pi/agent/npm ]; then
+    # npm and git are bound directly rather than snapshotted (node_modules and checkouts are not
+    # worth copying). Fall back to the legacy paths when the whole ~/.pi is mounted instead.
+    if [ -d /host-pi-npm ]; then
+      ln -s /host-pi-npm /root/.pi/agent/npm
+    elif [ -d /host-pi/agent/npm ]; then
       ln -s /host-pi/agent/npm /root/.pi/agent/npm
     fi
-    if [ -d /host-pi/agent/git ]; then
+    if [ -d /host-pi-git ]; then
+      ln -s /host-pi-git /root/.pi/agent/git
+    elif [ -d /host-pi/agent/git ]; then
       ln -s /host-pi/agent/git /root/.pi/agent/git
     fi
 
@@ -211,6 +217,39 @@ EOF
         echo "[pi-container] provider keys ready"
       else
         echo "[pi-container] warning: no keys after ${PIC_KEYS_WAIT}s; starting without them"
+      fi
+    fi
+
+    # Environment-form secrets (Anthropic credentials, legacy "${NAME}" providers) arrive as
+    # files in the key tmpfs, piped in over exec stdin after start, so nothing sensitive is ever
+    # declared in the container configuration. Export exactly the requested names from there,
+    # right before exec'ing pi: an allowlist rather than "every file", so a stray file cannot
+    # override PATH, NODE_OPTIONS, LD_PRELOAD or the launcher's own PIC_* knobs.
+    if [ -n "${PIC_ENV_EXPORT:-}" ] && [ -n "${PI_KEY_DIR:-}" ]; then
+      _exported=''
+      _absent=''
+      _saved_ifs=$IFS
+      IFS=','
+      for _name in $PIC_ENV_EXPORT; do
+        case "$_name" in
+          ''|*[!A-Za-z0-9_]*|[0-9]*|PIC_*|PI_CONTAINER_*|HERDR_*)
+            echo "[pi-container] refusing to export disallowed variable name: ${_name:-<empty>}" >&2
+            continue
+            ;;
+        esac
+        if [ -f "$PI_KEY_DIR/$_name" ]; then
+          export "$_name=$(cat "$PI_KEY_DIR/$_name")"
+          _exported="$_exported $_name"
+        else
+          _absent="$_absent $_name"
+        fi
+      done
+      IFS=$_saved_ifs
+      if [ -n "$_absent" ]; then
+        echo "[pi-container] no value for:${_absent}; pi sees those as unset" >&2
+      fi
+      if [ -n "$_exported" ]; then
+        echo "[pi-container] exported from $PI_KEY_DIR:${_exported}"
       fi
     fi
 

@@ -18,11 +18,13 @@ const {
   execReadyArgs,
   execWriteArgs,
   keyCommandUri,
+  keyReadTimeoutMs,
   keyTargetPath,
   providerKeyCommand,
   resolveKeyCommandValue,
   safeKeyFileName,
 } = require('./provider-keys.cjs');
+const { resolveEnvSecretValues } = require('./host-secrets.cjs');
 
 const verbose = process.env.PIC_KEYS_VERBOSE === '1';
 const log = (...args) => {
@@ -98,18 +100,52 @@ function keyMountIsReadOnly(info) {
 }
 
 const modelsPath = modelsJsonPath();
-if (!fs.existsSync(modelsPath)) process.exit(0);
+const modelsText = fs.existsSync(modelsPath) ? fs.readFileSync(modelsPath, 'utf8') : '';
+const providerIds = commandKeyProviderIds(modelsText).filter((providerId) => {
+  if (safeKeyFileName(providerId)) return true;
+  warn(`${providerId}: provider id cannot be used as a file name; its key was not injected`);
+  return false;
+});
 
-const modelsText = fs.readFileSync(modelsPath, 'utf8');
-const providerIds = commandKeyProviderIds(modelsText);
-if (providerIds.length === 0) process.exit(0);
+// Environment-form secrets (Anthropic credentials, legacy "${NAME}" providers) travel through
+// the same tmpfs: the launcher declares the names in PIC_ENV_EXPORT, and entrypoint.sh exports
+// them inside the VM. Nothing sensitive is ever recorded in the container configuration.
+const exportNames = (process.env.PIC_ENV_EXPORT || '').split(',').map((name) => name.trim()).filter(Boolean);
+const anthropicRequested = process.env.PIC_ANTHROPIC === '1';
+
+function providersEnvText() {
+  const file = process.env.PI_PROVIDERS_ENV || path.join(os.homedir(), '.config', 'pi', 'providers.env');
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : undefined;
+}
+
+// PI_ANTHROPIC_KEY_CMD is an opt-in host command (e.g. an `op read` lookup); bounded like every
+// other read so a manager waiting on an approval dialog cannot stall the launch.
+function runKeyCommand(cmd) {
+  const result = spawnSync(cmd, { shell: true, encoding: 'utf8', timeout: keyReadTimeoutMs() });
+  if (result.error || result.status !== 0) {
+    warn(`PI_ANTHROPIC_KEY_CMD failed: ${(result.stderr || result.error?.message || `exit ${result.status}`)}`.trim());
+    return '';
+  }
+  return String(result.stdout || '');
+}
+
+const envSecrets = exportNames.length
+  ? resolveEnvSecretValues({
+      names: exportNames,
+      modelsText,
+      env: process.env,
+      providersEnvText: providersEnvText(),
+      anthropicEnabled: anthropicRequested,
+      runCommand: runKeyCommand,
+    })
+  : { values: {}, missing: [] };
+
+if (envSecrets.missing.length > 0) {
+  warn(`no value for ${envSecrets.missing.join(', ')}; Pi will see those as unset in the container`);
+}
 
 const resolved = [];
 for (const providerId of providerIds) {
-  if (!safeKeyFileName(providerId)) {
-    warn(`${providerId}: provider id cannot be used as a file name; its key was not injected`);
-    continue;
-  }
   const apiKey = providerKeyCommand(modelsText, providerId);
   const { value, reason } = resolveKeyCommandValue({ apiKey });
   if (!value) {
@@ -125,6 +161,11 @@ for (const providerId of providerIds) {
     continue;
   }
   resolved.push({ providerId, value });
+}
+
+for (const [name, value] of Object.entries(envSecrets.values)) {
+  if (!safeKeyFileName(name)) continue;
+  resolved.push({ providerId: name, value });
 }
 
 if (waitForContainer(waitSeconds) !== true) {

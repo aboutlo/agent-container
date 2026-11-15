@@ -25,6 +25,12 @@ const {
   tmpfsMountArgs,
 } = require('./provider-keys.cjs');
 const { tcpReachable, tunnelOnlyHosts, tunnelWarning } = require('./provider-reachability.cjs');
+const {
+  buildHostPiSnapshot,
+  hostPiMountArgs,
+  snapshotDirFor,
+} = require('./host-pi-tree.cjs');
+const { envExportArgs, envSecretNames, legacySecretEnvArgs, anthropicEnvironmentNames } = require('./host-secrets.cjs');
 
 function readTextIfExists(file) {
   try {
@@ -82,6 +88,17 @@ const providerKeysTransport = (process.env.PIC_KEYS_TRANSPORT || keysTransportDe
 // Upper bound for the entrypoint's wait for the keys, in seconds. Bounded on purpose: a
 // locked vault or a dead injector must not hang the session.
 const providerKeysWaitSeconds = Number(process.env.PIC_KEYS_WAIT ?? 25);
+
+// ~/.pi is never mounted into a container: it holds agent/sessions (every transcript ever
+// recorded) and agent/auth.json (stored provider credentials), and a read-only mount is still
+// readable by every process in the container. A filtered snapshot of it is mounted instead.
+const hostPiSourceDir = path.join(home || '', '.pi');
+const hostPiSnapshotEnabled = process.env.PIC_HOST_PI_SNAPSHOT !== '0';
+const hostPiSnapshotDir = snapshotDirFor({ home });
+const hostPiExtraExcludes = (process.env.PIC_HOST_PI_EXTRA_EXCLUDES || '')
+  .split(',')
+  .map((entry) => entry.trim())
+  .filter(Boolean);
 const stagedHostSkillsDir = path.join(workdir, '.pi', 'host-agent-skills');
 const stagedHostExtensionsDir = path.join(workdir, '.pi', 'host-agent-extensions');
 const herdrEnvironmentNames = ['HERDR_ENV', 'HERDR_WORKSPACE_ID', 'HERDR_TAB_ID', 'HERDR_PANE_ID', 'HERDR_AGENT'];
@@ -105,9 +122,9 @@ function proxyEnvironmentArgs() {
   return buildProxyEnvironmentArgs(proxyUrl, { enabled: proxyEnabled });
 }
 
-// Anthropic env keys to forward into the container. The container does not
-// inherit the host env, so without this the key never reaches Pi inside.
-const anthropicEnvironmentNames = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN'];
+// Anthropic env keys to hand to Pi inside the container. The container does not inherit the
+// host env, so without this the key never reaches Pi inside. Values travel through the key
+// tmpfs; only the legacy transport puts them on the command line.
 
 // Generic, opt-in way to source a key without storing it anywhere: when
 // --anthropic is passed but no ANTHROPIC_* key is in the environment, run the
@@ -129,75 +146,132 @@ function runAnthropicKeyCommand(cmd) {
   return '';
 }
 
-function anthropicEnvironmentArgs({ useAnthropic } = {}) {
-  if (!useAnthropic) return [];
-  const args = [];
-  let any = false;
-  for (const name of anthropicEnvironmentNames) {
-    const value = process.env[name];
-    if (value) {
-      args.push('-e', `${name}=${value}`);
-      any = true;
-    }
-  }
-  if (!any) {
-    const cmd = process.env.PI_ANTHROPIC_KEY_CMD;
-    if (cmd) {
-      const key = runAnthropicKeyCommand(cmd);
-      if (key) {
-        args.push('-e', `ANTHROPIC_API_KEY=${key}`);
-        any = true;
-      } else {
-        log('warning: --anthropic requested but PI_ANTHROPIC_KEY_CMD produced no key; using local auth');
-      }
-    } else {
-      log('warning: --anthropic requested but no ANTHROPIC_* key in env and PI_ANTHROPIC_KEY_CMD unset; using local auth');
-    }
-  }
-  // When an Anthropic key is in play, ignore the host's stored auth.json:
-  // Pi resolves stored credentials before env keys, so a copied auth.json would
-  // shadow ANTHROPIC_API_KEY. entrypoint.sh honors PIC_EXCLUDE_AUTH=1 to skip it.
-  if (any) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
-  return args;
-}
-
-// Support, not the default: a models.json that interpolates "${PI_*_API_KEY}" names is
-// resolved (host env, then ~/.config/pi/providers.env) and forwarded as `-e NAME=<value>`.
-// Those values are recorded by Apple container in `container inspect` and in a
-// world-readable config.json under ~/Library/Application Support, so prefer the file form:
-// ~/.config/pi/keys/<provider> plus a "!cat" apiKey command (see pic-keys), which keeps the
-// secret off the command line entirely.
-// Resolution rules live in provider-env.cjs, which has its own tests.
-function providerEnvironmentArgs() {
-  const modelsPath = path.join(home, '.pi', 'agent', 'models.json');
-  const envPath = process.env.PI_PROVIDERS_ENV || path.join(home, '.config', 'pi', 'providers.env');
-  const modelsText = readTextIfExists(modelsPath);
-  if (modelsText === null) return [];
-  const { values, missing } = resolveProviderEnv({
-    modelsText,
-    processEnv: process.env,
-    providersEnvText: readTextIfExists(envPath),
-  });
-  if (missing.length > 0) {
-    log(`warning: ${missing.join(', ')} unset and absent from ${envPath}; those providers send an empty key`);
-  }
-  const forwarded = Object.keys(values);
-  if (forwarded.length > 0) {
-    log(`note: forwarding ${forwarded.join(', ')} with -e; prefer ~/.config/pi/keys/<provider> plus a "!cat" apiKey (see pic-keys) so no key reaches the container command line`);
-  }
-  return Object.entries(values).flatMap(([name, value]) => ['-e', `${name}=${value}`]);
-}
+// Anthropic keys and the legacy "${NAME}" providers used to be forwarded here as
+// `-e NAME=<value>`. They now travel through the key tmpfs like every other secret (see
+// host-secrets.cjs and pic-keys-inject.cjs); only the fallback for a transport that cannot
+// inject keeps the old behaviour, and it warns.
 
 // Providers whose apiKey is `!command` are the only ones needing a key at all.
 function providerKeyProviders() {
-  const modelsText = readTextIfExists(path.join(home || '', '.pi', 'agent', 'models.json'));
-  return commandKeyProviderIds(modelsText || '');
+  return commandKeyProviderIds(providerModelsText());
 }
 
-// True when this launcher is responsible for putting the keys inside the container itself
-// (tmpfs transport). Read-only bind or off means the container reads host files instead.
-function shouldInjectProviderKeys() {
-  return providerKeysTransport === 'tmpfs' && providerKeyProviders().length > 0;
+// Environment-form secrets this launch needs inside the container. Names only: the values are
+// resolved and piped in by pic-keys-inject.cjs, so the parent process never holds one.
+
+function secretNamesFor({ anthropicEnabled } = {}) {
+  return envSecretNames({ modelsText: providerModelsText(), env: process.env, anthropicEnabled });
+}
+
+// True when this launcher is responsible for putting secrets inside the container itself
+// (tmpfs transport). With bind or off transport the container reads host files and `-e` is
+// used for environment secrets, as before.
+function shouldInjectSecrets({ anthropicEnabled } = {}) {
+  if (providerKeysTransport !== 'tmpfs') return false;
+  return providerKeyProviders().length > 0 || secretNamesFor({ anthropicEnabled }).length > 0;
+}
+
+// What goes on the container command line for secrets: names in tmpfs mode (nothing sensitive),
+// values only when injection is unavailable, with the old warning.
+function secretArgsForLaunch({ anthropicEnabled, injectSecrets } = {}) {
+  if (injectSecrets) return envExportArgs(secretNamesFor({ anthropicEnabled }));
+  const values = resolveLegacySecretValues({ anthropicEnabled });
+  const names = Object.keys(values);
+  if (names.length === 0) {
+    if (anthropicEnabled) {
+      log('warning: --anthropic requested but no ANTHROPIC_* key in env and PI_ANTHROPIC_KEY_CMD produced nothing; using local auth');
+    }
+    return [];
+  }
+  log(`note: injecting is unavailable, so ${names.join(', ')} is passed with -e; the value is recorded in the container configuration (0644) and shown by container inspect`);
+  const args = legacySecretEnvArgs(values);
+  // Pi resolves stored credentials before env keys, so a copied auth.json would shadow
+  // ANTHROPIC_API_KEY; entrypoint.sh drops it on request.
+  if (names.some((name) => name.startsWith('ANTHROPIC_'))) args.push('-e', 'PIC_EXCLUDE_AUTH=1');
+  return args;
+}
+
+// Values for the legacy `-e` path: Anthropic keys the way they used to be read, plus the
+// models.json "${NAME}" interpolation.
+function resolveLegacySecretValues({ anthropicEnabled } = {}) {
+  const values = {};
+  if (anthropicEnabled) {
+    for (const name of anthropicEnvironmentNames) {
+      if (process.env[name]) values[name] = process.env[name];
+    }
+    if (!Object.keys(values).length && process.env.PI_ANTHROPIC_KEY_CMD) {
+      const key = runAnthropicKeyCommand(process.env.PI_ANTHROPIC_KEY_CMD);
+      if (key) values.ANTHROPIC_API_KEY = key;
+    }
+  }
+  const modelsPath = path.join(home, '.pi', 'agent', 'models.json');
+  const envPath = process.env.PI_PROVIDERS_ENV || path.join(home, '.config', 'pi', 'providers.env');
+  const modelsText = readTextIfExists(modelsPath);
+  if (modelsText !== null) {
+    const { values: providerValues, missing } = resolveProviderEnv({
+      modelsText,
+      processEnv: process.env,
+      providersEnvText: readTextIfExists(envPath),
+    });
+    if (missing.length > 0) log(`warning: ${missing.join(', ')} unset and absent from ${envPath}; those providers send an empty key`);
+    Object.assign(values, providerValues);
+  }
+  return values;
+}
+
+// Refresh the ~/.pi snapshot that gets mounted. Runs before every launch, including the reuse
+function refreshHostPiSnapshot() {
+  if (!hostPiSnapshotEnabled) {
+    log(`mounting ${hostPiSourceDir} directly (PIC_HOST_PI_SNAPSHOT=0): transcripts and auth.json will be readable in the container`);
+    return { ok: false, skipped: true };
+  }
+  const result = buildHostPiSnapshot({
+    source: hostPiSourceDir,
+    target: hostPiSnapshotDir,
+    extraExcludes: hostPiExtraExcludes,
+  });
+  if (!result.ok) log(`warning: could not refresh ${hostPiSnapshotDir}: ${result.reason}`);
+  else if (result.warning) log(`note: ${result.warning}`);
+  if (result.ok && verbose) log(`host pi snapshot: ${hostPiSnapshotDir} (${result.via})`);
+  return result;
+}
+
+// The mounts a launch needs: the snapshot at /host-pi, plus npm and git bound directly (they
+// are node_modules and checkouts, so copying them into the snapshot would be slow and pointless).
+function hostPiMountArgsForRun() {
+  const agentDir = path.join(hostPiSourceDir, 'agent');
+  let snapshotDir = null;
+  if (hostPiSnapshotEnabled) {
+    if (!fs.existsSync(hostPiSourceDir)) {
+      // Nothing to share: pi works without ~/.pi (no providers, no settings), and the
+      // entrypoint checks for /host-pi before copying.
+      log(`note: no ${hostPiSourceDir} to share; the container starts with an empty pi configuration`);
+      return [];
+    }
+    const result = refreshHostPiSnapshot();
+    const hasContent = () => {
+      try {
+        return fs.readdirSync(hostPiSnapshotDir).length > 0;
+      } catch {
+        return false;
+      }
+    };
+    if (!result.ok && !hasContent()) {
+      throw new Error(
+        `cannot build the ${hostPiSnapshotDir} snapshot (${result.reason}). ` +
+          'Refusing to mount ~/.pi instead: that would expose agent/sessions and agent/auth.json. ' +
+          'Set PIC_HOST_PI_SNAPSHOT=0 to opt into the old behaviour.',
+      );
+    }
+    if (!result.ok) log('note: using the previous snapshot; it may be stale');
+    snapshotDir = hostPiSnapshotDir;
+  }
+  return hostPiMountArgs({
+    snapshotDir,
+    source: snapshotDir ? null : hostPiSourceDir,
+    npmSource: path.join(agentDir, 'npm'),
+    gitSource: path.join(agentDir, 'git'),
+  });
 }
 
 function providerKeysMountArgs({ inject = false } = {}) {
@@ -238,10 +312,15 @@ function spawnProviderKeyInjector(target) {
     // Pi owns the terminal from here on: a message printed over its TUI corrupts the screen,
     // so the injector writes to a log that is reported after Pi exits.
     providerKeyInjectorLog = path.join(os.tmpdir(), `${commandName}-keys-${target}.log`);
-    const fd = fs.openSync(providerKeyInjectorLog, 'w');
+    const fd = fs.openSync(providerKeyInjectorLog, 'w', 0o600);
     stdio = ['ignore', fd, fd];
   }
-  const child = spawn(process.execPath, args, { detached: true, stdio });
+  const child = spawn(process.execPath, args, {
+    detached: true,
+    stdio,
+    // Names, never values: the injector resolves the values itself and pipes them in.
+    env: { ...process.env, PIC_ENV_EXPORT: secretNamesFor({ anthropicEnabled }).join(','), PIC_ANTHROPIC: anthropicEnabled ? '1' : '0' },
+  });
   child.on('error', (error) => log(`warning: could not start the key injector: ${error.message}`));
   child.unref();
 }
@@ -255,10 +334,6 @@ function reportProviderKeyInjector() {
     return;
   }
   for (const line of text.split('\n')) if (line.trim()) console.error(line.trim());
-}
-
-function providerKeysWarningTarget() {
-  return shouldInjectProviderKeys() ? 'live read at launch' : providerKeysHostDir;
 }
 
 // A `!…` apiKey needs either the host key file or a host that can run its command. In tmpfs
@@ -492,7 +567,8 @@ function containerRunArgs(commandArgs, { envArgs = [], includeHerdrSocket = fals
     ...extraVolumes.flatMap(v => ['--volume', v]),
     ...(includeHerdrSocket ? herdrSocketVolumeArgs() : []),
     ...extraPublish.flatMap(p => ['--publish', p]),
-    '--mount', `type=bind,source=${path.join(home, '.pi')},target=/host-pi,readonly`,
+    // A filtered snapshot of ~/.pi, never ~/.pi itself: see host-pi-tree.cjs.
+    ...hostPiMountArgsForRun(),
     ...providerKeysMountArgs({ inject: injectKeys }),
     '--dns', '1.1.1.1',
     ...envArgs,
@@ -668,15 +744,14 @@ async function main() {
     reportProviderKeyInjector();
   }
 
-  const injectKeys = shouldInjectProviderKeys();
+  const injectKeys = shouldInjectSecrets({ anthropicEnabled });
   const keysTarget = existingContainerId || containerNameFor({ prefix: commandName, volumeSuffix });
 
   if (attachMode) {
     const shellArgs = extraPiArgs.length > 0 ? extraPiArgs : ['/bin/bash'];
     const envArgs = [
       ...proxyEnvironmentArgs(),
-      ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-      ...providerEnvironmentArgs(),
+      ...secretArgsForLaunch({ anthropicEnabled, injectSecrets: injectKeys }),
       ...providerKeysEnvArgs({ inject: injectKeys }),
     ];
 
@@ -712,8 +787,7 @@ async function main() {
     const args = containerExecArgs(existingContainerId, commandArgs, {
       envArgs: [
         ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-        ...providerEnvironmentArgs(),
+        ...secretArgsForLaunch({ anthropicEnabled, injectSecrets: injectKeys }),
         ...providerKeysEnvArgs({ inject: injectKeys }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),
@@ -730,8 +804,7 @@ async function main() {
       containerName: keysTarget,
       envArgs: [
         ...proxyEnvironmentArgs(),
-        ...anthropicEnvironmentArgs({ useAnthropic: anthropicEnabled }),
-        ...providerEnvironmentArgs(),
+        ...secretArgsForLaunch({ anthropicEnabled, injectSecrets: injectKeys }),
         ...providerKeysEnvArgs({ inject: injectKeys }),
         ...herdrEnvironmentArgs(),
         ...herdrBridgeEnvironmentArgs(herdrBridge),

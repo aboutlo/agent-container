@@ -161,6 +161,23 @@ pic-keys omlx-clanker "op://Vault/Item/Field"   # first time, or after a rotatio
 pic-keys --all
 ```
 
+Environment secrets use the same pipe. `pic --anthropic` (and the legacy `"${NAME}"`
+providers) used to cross as `-e ANTHROPIC_API_KEY=<value>`, which is recorded verbatim in the
+container's `config.json` and shown by `container inspect`. Now only the *names* are declared
+(`-e PIC_ENV_EXPORT=ANTHROPIC_API_KEY,...`), the injector writes each value into the key tmpfs,
+and the entrypoint exports them inside the VM just before exec'ing pi:
+
+```
+[pi-container] exported from /run/pi-keys: ANTHROPIC_API_KEY
+```
+
+Only names that models.json references, plus the Anthropic trio when `--anthropic` was asked
+for, are resolvable (`host-secrets.cjs`), and `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `DYLD_*`,
+`PIC_*` and `HERDR_*` can never be exported, so a stray file in the tmpfs cannot hijack the
+process. Measured with canaries: the value reaches pi's own environment, and no canary appears
+in any recorded configuration on the host. If the transport cannot inject
+(`PIC_KEYS_TRANSPORT=bind|off`) the old `-e` behaviour is used and says so.
+
 Files, when you choose to have them, are written 0600 in a 0700 directory through a temp file
 and a rename. The value is never printed, never a command-line argument, never exported. For an
 API-credential item the 1Password field is `credential`, singular. Pi caches a resolved key for
@@ -192,7 +209,8 @@ Re-run the whole proof (pty launch, tmpfs check, hash comparison, host-side leak
 ```
 
 Knobs: `PIC_KEYS_TRANSPORT` (`tmpfs` | `bind` | `off`), `PIC_KEYS_WAIT` (gate seconds, `0`
-disables), `PIC_KEY_READ_TIMEOUT` (seconds for one live read), `PIC_KEYS_HOST_DIR`,
+disables), `PIC_KEY_READ_TIMEOUT` (seconds for one live read), `PIC_HOST_PI_SNAPSHOT`,
+`PIC_HOST_PI_SNAPSHOT_DIR`, `PIC_HOST_PI_EXTRA_EXCLUDES`, `PIC_KEYS_HOST_DIR`,
 `PIC_PROVIDER_KEYS_DIR`, `PIC_KEYS_VERBOSE=1`, and `OP_BIN` (`pic-keys` only; `models.json`
 names the binary itself).
 
@@ -224,6 +242,29 @@ thing that outlives a container is the named `<workdir>-<hash>-node-modules` vol
 deliberate: `container volume delete <name>` removes it. The entrypoint's gate and the reuse path
 mean a second `pic` in the same directory execs into the running container and refreshes the keys
 rather than starting a new one.
+
+## What a container can see of the host
+
+`~/.pi` is **not** mounted into containers. It holds `agent/sessions` (every transcript pi has
+recorded - the largest credential sink pi produces) and `agent/auth.json` (stored provider
+credentials), and a read-only mount is still readable by every process in the container: measured
+from inside as 25 transcripts and an `auth.json`.
+
+Instead `pic` refreshes a filtered snapshot before each launch
+(`~/.cache/pi-container/host-pi`, mode 0700, via `rsync -a --delete`, with a `tar` fallback) and
+mounts that read-only at `/host-pi`:
+
+| excluded from the snapshot | why |
+|---|---|
+| `agent/sessions` | transcripts: contains anything ever printed in a session |
+| `agent/auth.json` | stored credentials; use `pic --anthropic` or a model key |
+| `agent/npm`, `agent/git` | bound read-only at `/host-pi-npm` and `/host-pi-git` instead (node_modules and checkouts are not worth copying) |
+| `agent/skills`, `agent/extensions`, `agent/bin`, `*.lock` | staged into the workspace, dereferenced |
+
+Extras: `PIC_HOST_PI_EXTRA_EXCLUDES=agent/prompts,...`. `PIC_HOST_PI_SNAPSHOT=0` restores the old
+whole-`~/.pi` mount and logs that it does so; if the snapshot cannot be built the launch is
+refused rather than silently falling back to the whole tree. Measured from inside after the
+change: 0 transcripts, no `auth.json`, and pi still lists all its models.
 
 ## Provider reachability: tunnels need the host proxy
 
