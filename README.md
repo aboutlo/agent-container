@@ -82,6 +82,19 @@ This installs `pic`, `pic-proxy`, and `clc-proxy`. Remove any existing shell
 function or alias named `pic`, because shell definitions take precedence over the
 linked executable.
 
+Or skip the manual steps and run the idempotent installer/doctor:
+
+```bash
+./install.sh --check     # report drift only, change nothing (exit 1 on drift)
+./install.sh             # deps, links, pi self-update, models.json staging, image, tests
+./install.sh --reap      # also stop and delete containers older than the current image
+./install.sh --no-cache  # rebuild the image without cache (upgrades pi inside the image)
+```
+
+The installer stages `~/.pi/agent/models.json` from `~/dotfiles/pi/models.json`, merging
+per-machine overrides from `~/.config/pi/models.local.json` provider by provider, and refuses
+`!command` apiKeys that break the key-injection contract described in Provider API Keys.
+
 `pic` uses direct networking by default. `pic --proxy` enables the host-side
 proxy; the older `pic-proxy` command remains an equivalent compatibility alias.
 
