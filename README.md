@@ -272,6 +272,14 @@ deliberate: `container volume delete <name>` removes it. The entrypoint's gate a
 mean a second `pic` in the same directory execs into the running container and refreshes the keys
 rather than starting a new one.
 
+Native `pi` gets the same treatment from the host side: a zsh function runs `pi-ready`
+(`~/dotfiles/utils/pi-ready.cjs`) before starting it, because pi caches a resolved apiKey for its
+whole process and no extension hook can cancel a run. `pi-ready` resolves the same `!command`
+keys and cross-checks `pi auth check`; two traps there are worth knowing on pi 1.5.0:
+`--no-refresh` reports `ready` from stored credential state without resolving anything, and the
+exit code is not a boolean (`provider_not_found` returns 0) - only the `status` field is
+trustworthy.
+
 ## Getting the key out of 1Password without the desktop app
 
 The manual path, which is what this machine uses: `op account add` once, then a password per
