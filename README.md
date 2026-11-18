@@ -272,6 +272,42 @@ deliberate: `container volume delete <name>` removes it. The entrypoint's gate a
 mean a second `pic` in the same directory execs into the running container and refreshes the keys
 rather than starting a new one.
 
+## Getting the key out of 1Password without the desktop app
+
+The manual path, which is what this machine uses: `op account add` once, then a password per
+session. No app, no biometric prompt, no standing key file.
+
+```zsh
+op account add --address my.1password.com --email you@example.org --shorthand my   # once
+export OP_ACCOUNT=my                                                              # every shell
+eval "$(op signin --account my)"                                                   # ~30 min of reads
+```
+
+`opin` and `opout` in `~/.zshrc` wrap the last two; `opin` verifies with `op vault list` because
+`op whoami` reads local config and prints your account happily while you are signed out.
+
+| fact | measured / documented |
+|---|---|
+| Session lifetime | 30 minutes of inactivity (docs); the token is in the environment, the session key encrypted on disk |
+| Where it is | env var `OP_SESSION_<userUUID>`, session key in `~/.config/op/config`, plus an `op daemon` and `$TMPDIR/com.agilebits.op.<uid>/` blobs |
+| What `op signout` clears | the saved session key only - **not** your env var, and the daemon keeps running (pid alive across signout, measured). `opout` clears the env var too |
+| Where the OTP belongs | only on **new devices**: "a second factor will be required to sign in to your account on a new device". Measured: `op account forget --all` keeps the same `device` id, and a fresh `op account add` still asks the code - so re-enrolment, not device identity, is the trigger |
+| Why not every request | `op signin` has three flags (`-f`, `--raw`, `--account`); there is no OTP option, and 1Password's accepted-risk list says a root process or an app with macOS accessibility permissions can circumvent the authorization prompt |
+| What a session can be used by | any process that inherits the environment, including an agent - a `--otp` gate in `pic` would be theatre, since the same user can call `op` directly |
+| Desktop-app integration | unrelated to this path; with it on, the config carries both `latest_signin` and `system_auth_latest_signin` and the CLI mixes the two. Turning it off (Settings > Developer) does not sign the app out |
+
+Two operational rules, learned the hard way: **never capture the output** of `op signin` or
+`op account add` (without `eval` they print `export OP_SESSION_...=…` in clear text), and keep
+`set -x` off around them. Secret values inside `pic` travel over exec stdin only.
+
+Headless and agent-launched shells are a different problem: on this machine `op` refuses to run
+outside a GUI session (`... because it's not owned by the current user. Change the owner or
+logged in user` - compare `stat -f '%Su' /dev/console` with `id -un`), so a background `pic`
+depends on the 0600 key file and fails loudly when there is none. For real automation, the
+supported path is a **service account** token - but it cannot read Personal, Private or Employee
+vaults, so the item has to move to a vault you can grant, and the token alone decrypts that vault
+(it carries the AUK, SRP, Secret Key and personal keyset), so treat it as a standing secret.
+
 ## What a container can see of the host
 
 `~/.pi` is **not** mounted into containers. It holds `agent/sessions` (every transcript pi has
