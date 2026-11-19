@@ -5,6 +5,9 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 ARG RGA_VERSION=0.10.10
 ARG TYPST_VERSION=0.15.0
+# Keep in lockstep with the host install (openspec --version); 2.x is a different
+# workflow, so upgrade host and container together on purpose.
+ARG OPENSPEC_VERSION=1.14.2
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -56,7 +59,7 @@ RUN apt-get update \
     && typst --version \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @earendil-works/pi-coding-agent pnpm@11.5.2 \
+RUN npm install -g @earendil-works/pi-coding-agent pnpm@11.5.2 "@fission-ai/openspec@${OPENSPEC_VERSION}" \
     && npm cache clean --force
 
 # Install Claude Code (native binary, lands at ~/.local/bin/claude, already on PATH)
