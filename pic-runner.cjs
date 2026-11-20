@@ -733,7 +733,10 @@ function findContainerWithMount(workdirPath) {
             if (mountSourcePath === normalizedWorkdir && mountTarget === workspaceTarget) {
               hasWorkdirMount = true;
             }
-            if (mountSourcePath === path.resolve(home, '.pi') && mountTarget === '/host-pi') {
+            // Same source the launch uses (containerMountArgs): the filtered snapshot, or
+            // ~/.pi only when PIC_HOST_PI_SNAPSHOT=0. Containers from before 719f0e3 mounted
+            // ~/.pi here and must stay non-reusable; that is the leak this removes.
+            if (mountSourcePath === path.resolve(hostPiSnapshotEnabled ? hostPiSnapshotDir : path.join(home, '.pi')) && mountTarget === '/host-pi') {
               hasPiConfigMount = true;
             }
           }
