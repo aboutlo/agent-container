@@ -144,6 +144,26 @@ function execMarkerArgs({ container, markerPath, otherPath, umask = '0177' }) {
   return ['exec', '-i', container, 'sh', '-c', `umask ${umask}; ${remove}cat > '${markerPath}'`];
 }
 
+// Turn a secret manager's stderr into the thing to do next. Generic "unlock your vault" advice
+// is wrong for the most common case on a machine where the desktop app integration is off: there
+// is nothing to unlock, the CLI simply has no session token in this shell.
+function credentialAdvice(reason) {
+  const text = String(reason || '').toLowerCase();
+  if (text.includes('not currently signed in') || text.includes('not signed in')) {
+    return 'the CLI has no session in this shell: sign in here, then run again  (opin, or eval "$(op signin --account my)")';
+  }
+  if (text.includes('owned by the current user') || text.includes('logged in user')) {
+    return 'op cannot run outside your GUI login session: compare `stat -f %Su /dev/console` with `id -un`, or use a key file (pic-keys <provider>)';
+  }
+  if (text.includes('no accounts found') || text.includes('account is not signed in')) {
+    return 'op has no account configured here: `op account list`, then export OP_ACCOUNT=<shorthand>';
+  }
+  if (text.includes('prompt') || text.includes('biometric') || text.includes('timeout') || text.includes('timed out')) {
+    return 'the secret manager did not answer: unlock it, or raise PIC_KEYS_WAIT / PIC_KEY_READ_TIMEOUT, or use a key file (pic-keys <provider>)';
+  }
+  return 'check the URI in models.json, or write a key file from a terminal where it can prompt: pic-keys <provider>';
+}
+
 // Whether the session is worth starting: a container whose every command-key provider failed is
 // not a working pi, and the error pi itself reports ("Failed to resolve API key") points at the
 // container rather than at the host-side read that failed. Missing env secrets do not decide.
@@ -210,6 +230,7 @@ module.exports = {
   keysFailedFile,
   keyTargetPath,
   keysEnvArgs,
+  credentialAdvice,
   keysGateArgs,
   keysMarkerPath,
   keysOutcome,

@@ -10,6 +10,7 @@ const {
   keyCommandUri,
   keyReadTimeoutMs,
   keysEnvArgs,
+  credentialAdvice,
   keysFailedFile,
   keysGateArgs,
   keysReadyFile,
@@ -214,4 +215,16 @@ test('one read gets enough time for a human to unlock a secret manager', () => {
   process.env.PIC_KEY_READ_TIMEOUT = '5';
   assert.strictEqual(keyReadTimeoutMs(), 5_000);
   delete process.env.PIC_KEY_READ_TIMEOUT;
+});
+
+test('the advice names the actual cause, not generic vault advice', () => {
+  assert.match(
+    credentialAdvice("[ERROR] could not read secret: error initializing client: You are not currently signed in."),
+    /no session in this shell/,
+    'the common case on a machine with no app integration is a missing session, not a locked app',
+  );
+  assert.match(credentialAdvice("it's not owned by the current user. Change the owner or logged in user"), /GUI login session/);
+  assert.match(credentialAdvice('no accounts found matching filter "nope"'), /op account list/);
+  assert.match(credentialAdvice('read timed out after 30s waiting for a prompt'), /PIC_KEYS_WAIT/);
+  assert.match(credentialAdvice('cat: no such file'), /pic-keys/);
 });

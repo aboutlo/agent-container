@@ -18,10 +18,14 @@ const {
   commandKeyProviderIds,
   containerNameFor,
   keysEnvArgs,
+  credentialAdvice,
+  keyCommandUri,
   keysGateArgs,
   keysMountArgs,
   keysTransportDefault,
   missingCommandKeys,
+  providerKeyCommand,
+  resolveKeyCommandValue,
   tmpfsMountArgs,
 } = require('./provider-keys.cjs');
 const { tcpReachable, tunnelOnlyHosts, tunnelWarning } = require('./provider-reachability.cjs');
@@ -356,6 +360,50 @@ function reportProviderKeyInjector() {
 // A `!…` apiKey needs either the host key file or a host that can run its command. In tmpfs
 // mode pic reads it live at launch, so a missing file is normal; in bind mode the provider
 // would silently vanish from /model, so warn before launching.
+// Ask every provider key command once, before anything is started. A deterministic host-side
+// failure (no op session in this shell, op refusing to run outside a GUI login session, wrong
+// URI) would otherwise surface only after proxy-chain is listening, the container is created and
+// the entrypoint gate has counted down: a minute of silence with the real reason in a log file
+// nobody reads, because the injector cannot write to a terminal pi is about to own.
+//
+// Values are measured and dropped; the launcher keeps nothing. The injector reads again later
+// (a secret manager read costs a few requests, which is cheaper than holding a secret here), and
+// a slow manager is still worth waiting for: that is what the entrypoint gate is for.
+function preflightProviderKeys() {
+  if (attachMode || !shouldInjectSecrets({ anthropicEnabled })) return;
+  if (process.env.PIC_KEYS_REQUIRED === '0') return;
+  const modelsText = providerModelsText();
+  if (!modelsText) return;
+  const providerIds = commandKeyProviderIds(modelsText);
+  if (providerIds.length === 0) return;
+
+  const failures = [];
+  let usable = 0;
+  for (const providerId of providerIds) {
+    const { value, reason } = resolveKeyCommandValue({ apiKey: providerKeyCommand(modelsText, providerId) });
+    if (value) {
+      usable += 1;
+      continue;
+    }
+    failures.push({ providerId, reason, uri: keyCommandUri(modelsText, providerId) });
+  }
+
+  if (usable > 0) {
+    for (const failure of failures) log(`warning: ${failure.providerId} will be unavailable in the container: ${failure.reason}`);
+    return;
+  }
+
+  const first = failures[0] || {};
+  console.error(
+    `[${commandName}] no provider credential; the session would fail on your first message.\n` +
+      `  provider : ${failures.map((failure) => failure.providerId).join(', ') || '(none configured)'}\n` +
+      `  cause    : ${first.reason || 'unknown'}${first.uri ? `\n  secret   : ${first.uri}` : ''}\n` +
+      `  fix      : ${credentialAdvice(first.reason)}\n` +
+      `  note     : nothing was started (no proxy, no container). Start anyway with: PIC_KEYS_REQUIRED=0 ${commandName} ...`,
+  );
+  process.exit(1);
+}
+
 function warnMissingProviderKeys() {
   const modelsText = providerModelsText();
   if (!modelsText) return;
@@ -722,6 +770,8 @@ async function main() {
 
   fs.mkdirSync(path.join(workdir, '.pi', 'agent', 'sessions'), { recursive: true });
   warnMissingProviderKeys();
+  const injectKeys = shouldInjectSecrets({ anthropicEnabled });
+  preflightProviderKeys();
   await warnUnreachableProviders();
   stageHostSkills();
   stageHostExtensions();
@@ -761,7 +811,6 @@ async function main() {
     reportProviderKeyInjector();
   }
 
-  const injectKeys = shouldInjectSecrets({ anthropicEnabled });
   const keysTarget = existingContainerId || containerNameFor({ prefix: commandName, volumeSuffix });
 
   if (attachMode) {

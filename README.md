@@ -212,6 +212,26 @@ API-credential item the 1Password field is `credential`, singular. Pi caches a r
 the lifetime of its process, so test with a fresh process, and note that `pi --list-models`
 never validates a key.
 
+Nothing is started until the host keys are known to resolve: before proxy-chain listens or a
+container is created, `pic` asks each provider's `!command` once and refuses immediately when none
+resolves - the injector cannot write to a terminal pi is about to own, so a gate countdown reads
+as a hang. The cause is mapped to an action instead of generic vault advice:
+
+```
+[pic] no provider credential; the session would fail on your first message.
+  provider : omlx-clanker
+  cause    : couldn't start daemon: ... it's not owned by the current user ...
+  secret   : op://Private/OMLX_API_KEY/credential
+  fix      : op cannot run outside your GUI login session: compare `stat -f %Su /dev/console` with `id -un`,
+             or use a key file (pic-keys <provider>)
+  note     : nothing was started (no proxy, no container). Start anyway with: PIC_KEYS_REQUIRED=0 pic ...
+```
+
+The gate stays as the backstop for a manager that is merely slow; `pic attach` and
+`PIC_KEYS_REQUIRED=0` skip the preflight. The preflight discards every value it reads - the
+injector resolves again on its own, which costs a few extra requests and keeps the launcher free
+of secrets.
+
 Why not `-e NAME=<key>` (measured on Apple container 1.7.1):
 
 * `-e` values appear verbatim in `container inspect` and `container list --format json`, and are
